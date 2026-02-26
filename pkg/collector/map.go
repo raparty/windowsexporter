@@ -79,19 +79,20 @@ func NewBuilderWithFlags[C Collector](fn BuilderWithFlags[C]) BuilderWithFlags[C
 
 //nolint:gochecknoglobals
 var BuildersWithFlags = map[string]BuilderWithFlags[Collector]{
-	ad.Name:                 NewBuilderWithFlags(ad.NewWithFlags),
-	adcs.Name:               NewBuilderWithFlags(adcs.NewWithFlags),
-	adfs.Name:               NewBuilderWithFlags(adfs.NewWithFlags),
-	cache.Name:              NewBuilderWithFlags(cache.NewWithFlags),
-	container.Name:          NewBuilderWithFlags(container.NewWithFlags),
-	cpu.Name:                NewBuilderWithFlags(cpu.NewWithFlags),
-	cpu_info.Name:           NewBuilderWithFlags(cpu_info.NewWithFlags),
-	cs.Name:                 NewBuilderWithFlags(cs.NewWithFlags),
-	dfsr.Name:               NewBuilderWithFlags(dfsr.NewWithFlags),
-	dhcp.Name:               NewBuilderWithFlags(dhcp.NewWithFlags),
-	diskdrive.Name:          NewBuilderWithFlags(diskdrive.NewWithFlags),
-	dns.Name:                NewBuilderWithFlags(dns.NewWithFlags),
-	eventlog.Name:           NewBuilderWithFlags(eventlog.NewWithFlags),
+	ad.Name:        NewBuilderWithFlags(ad.NewWithFlags),
+	adcs.Name:      NewBuilderWithFlags(adcs.NewWithFlags),
+	adfs.Name:      NewBuilderWithFlags(adfs.NewWithFlags),
+	cache.Name:     NewBuilderWithFlags(cache.NewWithFlags),
+	container.Name: NewBuilderWithFlags(container.NewWithFlags),
+	cpu.Name:       NewBuilderWithFlags(cpu.NewWithFlags),
+	cpu_info.Name:  NewBuilderWithFlags(cpu_info.NewWithFlags),
+	cs.Name:        NewBuilderWithFlags(cs.NewWithFlags),
+	dfsr.Name:      NewBuilderWithFlags(dfsr.NewWithFlags),
+	dhcp.Name:      NewBuilderWithFlags(dhcp.NewWithFlags),
+	diskdrive.Name: NewBuilderWithFlags(diskdrive.NewWithFlags),
+	dns.Name:       NewBuilderWithFlags(dns.NewWithFlags),
+	// Wrap the eventlog builder to return the generic Collector interface
+	eventlog.Name:           func(app *kingpin.Application) Collector { return eventlog.NewWithFlags(app) },
 	exchange.Name:           NewBuilderWithFlags(exchange.NewWithFlags),
 	filetime.Name:           NewBuilderWithFlags(filetime.NewWithFlags),
 	fsrmquota.Name:          NewBuilderWithFlags(fsrmquota.NewWithFlags),
@@ -131,8 +132,6 @@ var BuildersWithFlags = map[string]BuilderWithFlags[Collector]{
 }
 
 // Available returns a sorted list of available collectors.
-//
-//goland:noinspection GoUnusedExportedFunction
 func Available() []string {
 	return slices.Sorted(maps.Keys(BuildersWithFlags))
 }

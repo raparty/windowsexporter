@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus-community/windows_exporter/internal/collector/dhcp"
 	"github.com/prometheus-community/windows_exporter/internal/collector/diskdrive"
 	"github.com/prometheus-community/windows_exporter/internal/collector/dns"
+	"github.com/prometheus-community/windows_exporter/internal/collector/eventlog"
 	"github.com/prometheus-community/windows_exporter/internal/collector/exchange"
 	"github.com/prometheus-community/windows_exporter/internal/collector/filetime"
 	"github.com/prometheus-community/windows_exporter/internal/collector/fsrmquota"
@@ -109,6 +110,7 @@ func NewWithConfig(config Config) *Collection {
 	collectors[dhcp.Name] = dhcp.New(&config.Dhcp)
 	collectors[diskdrive.Name] = diskdrive.New(&config.DiskDrive)
 	collectors[dns.Name] = dns.New(&config.DNS)
+	collectors[eventlog.Name] = eventlog.New(&config.EventLog)
 	collectors[exchange.Name] = exchange.New(&config.Exchange)
 	collectors[filetime.Name] = filetime.New(&config.Filetime)
 	collectors[fsrmquota.Name] = fsrmquota.New(&config.Fsrmquota)
