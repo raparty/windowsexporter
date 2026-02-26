@@ -31,6 +31,18 @@ import (
 
 const Name = "eventlog"
 
+// registerCollector is intentionally a no-op here.
+// Registration is handled via pkg/collector/map.go which directly imports this package.
+// This function exists to establish the self-registration pattern for future use.
+func registerCollector(name string, fn func(*kingpin.Application) *Collector) {
+	_ = name
+	_ = fn
+}
+
+func init() {
+	registerCollector(Name, NewWithFlags)
+}
+
 // Windows Event Log type constants (EVENTLOGRECORD.EventType).
 const (
 	eventlogSuccess      uint16 = 0x0000
