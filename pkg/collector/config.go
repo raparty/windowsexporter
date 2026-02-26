@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus-community/windows_exporter/internal/collector/dhcp"
 	"github.com/prometheus-community/windows_exporter/internal/collector/diskdrive"
 	"github.com/prometheus-community/windows_exporter/internal/collector/dns"
+	"github.com/prometheus-community/windows_exporter/internal/collector/eventlog"
 	"github.com/prometheus-community/windows_exporter/internal/collector/exchange"
 	"github.com/prometheus-community/windows_exporter/internal/collector/filetime"
 	"github.com/prometheus-community/windows_exporter/internal/collector/fsrmquota"
@@ -79,6 +80,7 @@ type Config struct {
 	Dhcp               dhcp.Config               `yaml:"dhcp"`
 	DiskDrive          diskdrive.Config          `yaml:"disk_drive"`
 	DNS                dns.Config                `yaml:"dns"`
+	EventLog           eventlog.Config           `yaml:"eventlog"`
 	Exchange           exchange.Config           `yaml:"exchange"`
 	Filetime           filetime.Config           `yaml:"filetime"`
 	Fsrmquota          fsrmquota.Config          `yaml:"fsrmquota"`
@@ -134,6 +136,7 @@ var ConfigDefaults = Config{
 	Dhcp:               dhcp.ConfigDefaults,
 	DiskDrive:          diskdrive.ConfigDefaults,
 	DNS:                dns.ConfigDefaults,
+	EventLog:           eventlog.ConfigDefaults,
 	Exchange:           exchange.ConfigDefaults,
 	Filetime:           filetime.ConfigDefaults,
 	Fsrmquota:          fsrmquota.ConfigDefaults,
