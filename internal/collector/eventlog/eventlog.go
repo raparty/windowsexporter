@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"unsafe"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -210,10 +211,18 @@ func NewWithFlags(app *kingpin.Application) *Collector {
 		config: ConfigDefaults,
 	}
 
+	var logNames string
+
 	app.Flag(
 		"collector.eventlog.log-names",
 		"Comma-separated list of Windows Event Log channels to collect. Defaults to Application and System.",
-	).Default("Application", "System").StringsVar(&c.config.LogNames)
+	).Default(strings.Join(ConfigDefaults.LogNames, ",")).StringVar(&logNames)
+
+	app.Action(func(*kingpin.ParseContext) error {
+		c.config.LogNames = strings.Split(logNames, ",")
+
+		return nil
+	})
 
 	return c
 }
