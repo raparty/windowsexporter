@@ -80,7 +80,7 @@ type Config struct {
 	Dhcp               dhcp.Config               `yaml:"dhcp"`
 	DiskDrive          diskdrive.Config          `yaml:"disk_drive"`
 	DNS                dns.Config                `yaml:"dns"`
-	EventLog           eventlog.Config           `yaml:"eventlog"`
+	EventLog           eventlog.Config           `yaml:"eventlog"` //nolint:tagliatelle
 	Exchange           exchange.Config           `yaml:"exchange"`
 	Filetime           filetime.Config           `yaml:"filetime"`
 	Fsrmquota          fsrmquota.Config          `yaml:"fsrmquota"`

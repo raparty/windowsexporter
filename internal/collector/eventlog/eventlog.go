@@ -50,6 +50,7 @@ const (
 
 const initialReadBufferSize = 64 * 1024
 
+//nolint:gochecknoglobals
 var eventLevelNames = map[uint16]string{
 	eventlogSuccess:      "success",
 	eventlogError:        "error",
@@ -78,6 +79,7 @@ type eventLogRecord struct {
 	DataOffset          uint32
 }
 
+//nolint:gochecknoglobals
 var (
 	modadvapi32 = windows.NewLazySystemDLL("advapi32.dll")
 
@@ -155,9 +157,10 @@ func readEventLog(handle windows.Handle, readFlags, recordOffset uint32, buf []b
 
 type Config struct {
 	LogNames []string `yaml:"log_names"`
-	EventIDs []string `yaml:"event_ids"`
+	EventIDs []string `yaml:"event_ids"` //nolint:tagliatelle
 }
 
+//nolint:gochecknoglobals
 var ConfigDefaults = Config{
 	LogNames: []string{"Application", "System"},
 	EventIDs: []string{"15", "55", "41", "1000", "100", "400-499"},
@@ -170,12 +173,8 @@ type eventIDFilter struct {
 }
 
 // newEventIDFilter parses a slice of event ID specs (e.g., "15", "400-499") into
-// a filter. A nil return value means no filtering – all event IDs are accepted.
+// a filter. An empty specs slice means no filtering – all event IDs are accepted.
 func newEventIDFilter(specs []string) (*eventIDFilter, error) {
-	if len(specs) == 0 {
-		return nil, nil
-	}
-
 	f := &eventIDFilter{
 		ids: make(map[uint32]struct{}),
 	}
@@ -186,38 +185,42 @@ func newEventIDFilter(specs []string) (*eventIDFilter, error) {
 			continue
 		}
 
-		if idx := strings.Index(spec, "-"); idx != -1 {
-			lo, err := strconv.ParseUint(spec[:idx], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
-			}
-
-			hi, err := strconv.ParseUint(spec[idx+1:], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
-			}
-
-			if lo > hi {
-				return nil, fmt.Errorf("invalid event ID range %q: low > high", spec)
-			}
-
-			f.ranges = append(f.ranges, [2]uint32{uint32(lo), uint32(hi)})
-		} else {
+		idx := strings.Index(spec, "-")
+		if idx == -1 {
 			id, err := strconv.ParseUint(spec, 10, 32)
 			if err != nil {
 				return nil, fmt.Errorf("invalid event ID %q: %w", spec, err)
 			}
 
 			f.ids[uint32(id)] = struct{}{}
+
+			continue
 		}
+
+		lo, err := strconv.ParseUint(spec[:idx], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
+		}
+
+		hi, err := strconv.ParseUint(spec[idx+1:], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
+		}
+
+		if lo > hi {
+			return nil, fmt.Errorf("invalid event ID range %q: low > high", spec)
+		}
+
+		f.ranges = append(f.ranges, [2]uint32{uint32(lo), uint32(hi)})
 	}
 
 	return f, nil
 }
 
 // contains returns true if the event ID should be collected.
+// An empty filter (no IDs and no ranges) accepts all event IDs.
 func (f *eventIDFilter) contains(id uint32) bool {
-	if f == nil {
+	if len(f.ids) == 0 && len(f.ranges) == 0 {
 		return true
 	}
 
@@ -401,6 +404,7 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		numRecords, err := getNumberOfEventLogRecords(handle)
 		if err != nil {
 			_ = closeEventLog(handle)
+
 			return fmt.Errorf("get number of event log records for %q: %w", logName, err)
 		}
 
@@ -411,8 +415,10 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 			oldest, err := getOldestEventLogRecord(handle)
 			if err != nil {
 				_ = closeEventLog(handle)
+
 				return fmt.Errorf("get oldest event log record for %q: %w", logName, err)
 			}
+
 			nextRecord = oldest + numRecords
 		}
 
@@ -435,6 +441,7 @@ func (c *Collector) Close() error {
 			)
 		}
 	}
+
 	return nil
 }
 
@@ -446,8 +453,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 				slog.Any("err", err),
 			)
 		}
+
 		c.emitCounts(ch, logName, state)
 	}
+
 	return nil
 }
 
@@ -462,21 +471,25 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 			buf,
 		)
 
+		if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+			return nil
+		}
+
+		if errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+			if minNeeded > 0 {
+				buf = make([]byte, minNeeded)
+			} else {
+				buf = make([]byte, len(buf)*2)
+			}
+
+			continue
+		}
+
+		if errors.Is(err, windows.Errno(1503)) {
+			return c.reopenLog(logName, state)
+		}
+
 		if err != nil {
-			if errors.Is(err, windows.ERROR_HANDLE_EOF) {
-				return nil
-			}
-			if errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
-				if minNeeded > 0 {
-					buf = make([]byte, minNeeded)
-				} else {
-					buf = make([]byte, len(buf)*2)
-				}
-				continue
-			}
-			if errors.Is(err, windows.Errno(1503)) {
-				return c.reopenLog(logName, state)
-			}
 			return fmt.Errorf("ReadEventLog: %w", err)
 		}
 
@@ -498,9 +511,10 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 				source := extractSourceName(buf, offset, rec.Length)
 
 				var faultingApplication string
+
 				if eventID == eventIDApplicationError {
 					if strs := extractInsertionStrings(buf, offset, rec); len(strs) > 0 {
-						faultingApplication = strs[0]
+						faultingApplication = sanitizeFaultingApplication(strs[0])
 					}
 				}
 
@@ -519,11 +533,26 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 	}
 }
 
-// Fixed the unused logName parameter by using an underscore
-func (c *Collector) reopenLog(_ string, state *logReadState) error {
+func (c *Collector) reopenLog(logName string, state *logReadState) error {
 	_ = closeEventLog(state.handle)
-	// We use the handle from the existing state to keep logic simple
-	// but the linter wanted logName used or removed.
+
+	state.handle = 0
+
+	handle, err := openEventLog(logName)
+	if err != nil {
+		return fmt.Errorf("reopen event log %q: %w", logName, err)
+	}
+
+	oldest, err := getOldestEventLogRecord(handle)
+	if err != nil {
+		_ = closeEventLog(handle)
+
+		return fmt.Errorf("get oldest event log record for %q after reopen: %w", logName, err)
+	}
+
+	state.handle = handle
+	state.nextRecordNumber = oldest
+
 	return nil
 }
 
