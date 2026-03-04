@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus-community/windows_exporter/internal/collector"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,8 +24,8 @@ const (
 )
 
 const (
-	eventlogSequentialRead uint32 = 0x0001
-	eventlogForwardsRead   uint32 = 0x0004
+	eventlogSeekRead     uint32 = 0x0002
+	eventlogForwardsRead uint32 = 0x0004
 )
 
 const initialReadBufferSize = 64 * 1024
@@ -148,7 +149,7 @@ func New(config *Config) *Collector {
 func NewWithFlags(app *kingpin.Application) *Collector {
 	c := &Collector{config: ConfigDefaults}
 	var logNames string
-	app.Flag("collector.eventlog.log-names", "Comma-separated list of Windows Event Log channels.").Default(strings.Join(ConfigDefaults.LogNames, ",")).StringVar(&logNames)
+	app.Flag("collector.eventlog.log-names", "Logs to watch.").Default(strings.Join(ConfigDefaults.LogNames, ",")).StringVar(&logNames)
 	app.Action(func(*kingpin.ParseContext) error {
 		c.config.LogNames = strings.Split(logNames, ",")
 		return nil
@@ -162,7 +163,7 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.logger = logger.With(slog.String("collector", Name))
 	c.eventTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "event_total"),
-		"Total number of filtered Windows Event Log errors.",
+		"Total critical Windows Event Log errors by ID.",
 		[]string{"channel", "level", "event_id"},
 		nil,
 	)
@@ -172,11 +173,11 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		if err != nil {
 			continue
 		}
-		numRecords, _ := getNumberOfEventLogRecords(handle)
-		oldest, _ := getOldestEventLogRecord(handle)
+		num, _ := getNumberOfEventLogRecords(handle)
+		old, _ := getOldestEventLogRecord(handle)
 		c.logState[logName] = &logReadState{
 			handle:           handle,
-			nextRecordNumber: oldest + numRecords,
+			nextRecordNumber: old + num,
 			idCounts:         make(map[uint32]float64),
 		}
 	}
@@ -203,14 +204,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 func (c *Collector) collectLog(logName string, state *logReadState) error {
 	buf := make([]byte, initialReadBufferSize)
 	for {
-		bytesRead, minNeeded, err := readEventLog(state.handle, eventlogSequentialRead|eventlogForwardsRead, state.nextRecordNumber, buf)
+		bytesRead, minNeeded, err := readEventLog(state.handle, eventlogSeekRead|eventlogForwardsRead, state.nextRecordNumber, buf)
 		if err != nil {
-			if errors.Is(err, windows.ERROR_HANDLE_EOF) { return nil }
+			if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+				return nil
+			}
 			if errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
 				buf = make([]byte, minNeeded)
 				continue
 			}
-			// Handle log rotation/clear
 			if errors.Is(err, windows.Errno(1503)) {
 				return c.reopenLog(logName, state)
 			}
@@ -222,11 +224,17 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 			eventID := rec.EventID & 0xFFFF
 			if rec.EventType == eventlogError {
 				isTarget := false
-				switch {
-				case eventID == 15, eventID == 55, eventID == 41, eventID == 1000, eventID == 100: isTarget = true
-				case eventID >= 400 && eventID <= 499: isTarget = true
+				switch eventID {
+				case 15, 55, 41, 100, 1000:
+					isTarget = true
+				default:
+					if eventID >= 400 && eventID <= 499 {
+						isTarget = true
+					}
 				}
-				if isTarget { state.idCounts[eventID]++ }
+				if isTarget {
+					state.idCounts[eventID]++
+				}
 			}
 			state.nextRecordNumber = rec.RecordNumber + 1
 			offset += rec.Length
@@ -234,7 +242,19 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 	}
 }
 
-func (c *Collector) reopenLog(_ string, state *logReadState) error {
+func (c *Collector) reopenLog(logName string, state *logReadState) error {
 	_ = closeEventLog(state.handle)
-	return nil 
+	h, err := openEventLog(logName)
+	if err != nil {
+		return err
+	}
+	state.handle = h
+	num, _ := getNumberOfEventLogRecords(h)
+	old, _ := getOldestEventLogRecord(h)
+	state.nextRecordNumber = old + num
+	return nil
+}
+
+func init() {
+	collector.RegisterCollector(Name, New, NewWithFlags)
 }
