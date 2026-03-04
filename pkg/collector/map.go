@@ -91,8 +91,7 @@ var BuildersWithFlags = map[string]BuilderWithFlags[Collector]{
 	dhcp.Name:      NewBuilderWithFlags(dhcp.NewWithFlags),
 	diskdrive.Name: NewBuilderWithFlags(diskdrive.NewWithFlags),
 	dns.Name:       NewBuilderWithFlags(dns.NewWithFlags),
-	// Wrap the eventlog builder to return the generic Collector interface
-	eventlog.Name:           func(app *kingpin.Application) Collector { return eventlog.NewWithFlags(app) },
+	eventlog.Name:           NewBuilderWithFlags(eventlog.NewWithFlags),
 	exchange.Name:           NewBuilderWithFlags(exchange.NewWithFlags),
 	filetime.Name:           NewBuilderWithFlags(filetime.NewWithFlags),
 	fsrmquota.Name:          NewBuilderWithFlags(fsrmquota.NewWithFlags),
