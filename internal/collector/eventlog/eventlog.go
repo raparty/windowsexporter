@@ -507,7 +507,7 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 			// The low-order 16 bits of EventID contain the actual event ID.
 			eventID := rec.EventID & 0xFFFF
 
-			if c.filter.contains(eventID) {
+			if c.filter.contains(eventID) && rec.EventType == eventlogError {
 				source := extractSourceName(buf, offset, rec.Length)
 
 				var faultingApplication string
