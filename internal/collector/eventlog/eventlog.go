@@ -36,8 +36,8 @@ const (
 )
 
 const (
-	eventlogSequentialRead uint32 = 0x0001
-	eventlogForwardsRead   uint32 = 0x0004
+	eventlogSeekRead     uint32 = 0x0002
+	eventlogForwardsRead uint32 = 0x0004
 )
 
 const initialReadBufferSize = 64 * 1024
@@ -177,7 +177,7 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.logger = logger.With(slog.String("collector", Name))
 	c.eventTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "event_total"),
-		"Total number of filtered Windows Event Log errors.",
+		"Number of filtered Windows Event Log errors observed in the last scrape.",
 		[]string{"channel", "level", "event_id"},
 		nil,
 	)
@@ -207,9 +207,10 @@ func (c *Collector) Close() error {
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	for logName, state := range c.logState {
+		state.idCounts = make(map[uint32]float64)
 		_ = c.collectLog(logName, state)
 		for id, count := range state.idCounts {
-			ch <- prometheus.MustNewConstMetric(c.eventTotal, prometheus.CounterValue, count, logName, "error", fmt.Sprint(id))
+			ch <- prometheus.MustNewConstMetric(c.eventTotal, prometheus.GaugeValue, count, logName, "error", fmt.Sprint(id))
 		}
 	}
 	return nil
@@ -218,7 +219,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 func (c *Collector) collectLog(logName string, state *logReadState) error {
 	buf := make([]byte, initialReadBufferSize)
 	for {
-		bytesRead, minNeeded, err := readEventLog(state.handle, eventlogSequentialRead|eventlogForwardsRead, state.nextRecordNumber, buf)
+		bytesRead, minNeeded, err := readEventLog(state.handle, eventlogSeekRead|eventlogForwardsRead, state.nextRecordNumber, buf)
 		if err != nil {
 			if errors.Is(err, windows.ERROR_HANDLE_EOF) { return nil }
 			if errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
@@ -236,12 +237,16 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 			rec := (*eventLogRecord)(unsafe.Pointer(&buf[offset]))
 			eventID := rec.EventID & 0xFFFF
 			if rec.EventType == eventlogError {
-				isTarget := false
-				switch {
-				case eventID == 15, eventID == 55, eventID == 41, eventID == 1000, eventID == 100: isTarget = true
-				case eventID >= 400 && eventID <= 499: isTarget = true
+				var isTarget bool
+				switch eventID {
+				case 15, 55, 41, 1000, 100:
+					isTarget = true
+				default:
+					isTarget = eventID >= 400 && eventID <= 499
 				}
-				if isTarget { state.idCounts[eventID]++ }
+				if isTarget {
+					state.idCounts[eventID]++
+				}
 			}
 			state.nextRecordNumber = rec.RecordNumber + 1
 			offset += rec.Length
