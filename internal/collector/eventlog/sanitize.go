@@ -15,9 +15,15 @@ package eventlog
 
 import "strings"
 
+// maxLabelLength is the maximum number of characters allowed in a sanitized
+// label value. Labels exceeding this length are truncated to prevent very
+// long metric label values from polluting the metrics output.
+const maxLabelLength = 128
+
 // sanitizeFaultingApplication extracts just the application name from the raw
 // insertion string. The value may contain a full path or multi-line content
 // (e.g. a stack trace); only the base filename of the first line is returned.
+// The result is also truncated to maxLabelLength characters.
 func sanitizeFaultingApplication(s string) string {
 	// Take only the first line in case the string contains a stack trace.
 	if idx := strings.IndexByte(s, '\n'); idx != -1 {
@@ -31,5 +37,11 @@ func sanitizeFaultingApplication(s string) string {
 		s = s[idx+1:]
 	}
 
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+
+	if len(s) > maxLabelLength {
+		s = s[:maxLabelLength]
+	}
+
+	return s
 }

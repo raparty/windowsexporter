@@ -13,7 +13,10 @@
 
 package eventlog
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSanitizeFaultingApplication(t *testing.T) {
 	t.Parallel()
@@ -62,6 +65,11 @@ func TestSanitizeFaultingApplication(t *testing.T) {
 			name:  "path with trailing separator",
 			input: `C:\Windows\`,
 			want:  "",
+		},
+		{
+			name:  "name exceeding max label length is truncated",
+			input: strings.Repeat("a", maxLabelLength+10),
+			want:  strings.Repeat("a", maxLabelLength),
 		},
 	}
 
