@@ -10,7 +10,6 @@ import (
 	"unsafe"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/prometheus-community/windows_exporter/internal/collector"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -255,6 +254,3 @@ func (c *Collector) reopenLog(logName string, state *logReadState) error {
 	return nil
 }
 
-func init() {
-	collector.RegisterCollector(Name, New, NewWithFlags)
-}
