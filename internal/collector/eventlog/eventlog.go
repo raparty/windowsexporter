@@ -1,3 +1,16 @@
+// Copyright 2024 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build windows
 
 package eventlog
@@ -48,6 +61,7 @@ type eventLogRecord struct {
 	DataOffset          uint32
 }
 
+//nolint:gochecknoglobals
 var (
 	modadvapi32 = windows.NewLazySystemDLL("advapi32.dll")
 
@@ -117,6 +131,7 @@ type Config struct {
 	LogNames []string `yaml:"log_names"`
 }
 
+//nolint:gochecknoglobals
 var ConfigDefaults = Config{
 	LogNames: []string{"Application", "System", "Microsoft-Windows-Diagnostics-Performance/Operational"},
 }
@@ -234,7 +249,15 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 	}
 }
 
-func (c *Collector) reopenLog(_ string, state *logReadState) error {
+func (c *Collector) reopenLog(logName string, state *logReadState) error {
 	_ = closeEventLog(state.handle)
-	return nil 
+
+	handle, err := openEventLog(logName)
+	if err != nil {
+		return err
+	}
+
+	state.handle = handle
+
+	return nil
 }
