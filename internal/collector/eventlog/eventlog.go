@@ -45,6 +45,7 @@ const (
 const (
 	eventlogSequentialRead uint32 = 0x0001
 	eventlogForwardsRead   uint32 = 0x0004
+	utf16CharSize          uint32 = 2 // bytes per UTF-16 code unit
 )
 
 const initialReadBufferSize = 64 * 1024
@@ -244,21 +245,63 @@ func extractSourceName(buf []byte, recordOffset, recLen uint32) string {
 		end = uint32(len(buf))
 	}
 
-	if start+2 > end {
+	if start+utf16CharSize > end {
 		return ""
 	}
 
-	available := (end - start) / 2
+	available := (end - start) / utf16CharSize
 	nameWords := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[start])), available)
 
 	return windows.UTF16ToString(nameWords)
 }
 
+// eventIDApplicationError is the Windows Application Error event ID.
+const eventIDApplicationError uint32 = 1000
+
+// extractInsertionStrings parses the NumStrings null-terminated UTF-16LE
+// strings stored at StringOffset inside an EVENTLOGRECORD.
+func extractInsertionStrings(buf []byte, recordOffset uint32, rec *eventLogRecord) []string {
+	if rec.NumStrings == 0 || rec.StringOffset == 0 {
+		return nil
+	}
+
+	strStart := recordOffset + rec.StringOffset
+	strEnd := recordOffset + rec.Length
+
+	if int(strEnd) > len(buf) {
+		strEnd = uint32(len(buf))
+	}
+
+	if strStart+utf16CharSize > strEnd {
+		return nil
+	}
+
+	wordCount := (strEnd - strStart) / utf16CharSize
+	words := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[strStart])), wordCount)
+
+	result := make([]string, 0, rec.NumStrings)
+
+	pos := 0
+
+	for i := 0; i < int(rec.NumStrings) && pos < len(words); i++ {
+		nul := pos
+		for nul < len(words) && words[nul] != 0 {
+			nul++
+		}
+
+		result = append(result, windows.UTF16ToString(words[pos:nul]))
+		pos = nul + 1
+	}
+
+	return result
+}
+
 // eventKey is the composite key used to accumulate per-event counts.
 type eventKey struct {
-	eventType uint16
-	eventID   uint32
-	source    string
+	eventType          uint16
+	eventID            uint32
+	source             string
+	faultingApplication string
 }
 
 type Collector struct {
@@ -343,7 +386,7 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.eventTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "event_total"),
 		"Total number of Windows Event Log events since the exporter started",
-		[]string{"channel", "level", "event_id", "source"},
+		[]string{"channel", "level", "event_id", "source", "faulting_application"},
 		nil,
 	)
 
@@ -453,10 +496,19 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 
 			if c.filter.contains(eventID) {
 				source := extractSourceName(buf, offset, rec.Length)
+
+				var faultingApplication string
+				if eventID == eventIDApplicationError {
+					if strs := extractInsertionStrings(buf, offset, rec); len(strs) > 0 {
+						faultingApplication = strs[0]
+					}
+				}
+
 				key := eventKey{
-					eventType: rec.EventType,
-					eventID:   eventID,
-					source:    source,
+					eventType:           rec.EventType,
+					eventID:             eventID,
+					source:              source,
+					faultingApplication: faultingApplication,
 				}
 				state.counts[key]++
 			}
@@ -490,6 +542,7 @@ func (c *Collector) emitCounts(ch chan<- prometheus.Metric, logName string, stat
 			levelName,
 			strconv.FormatUint(uint64(key.eventID), 10),
 			key.source,
+			key.faultingApplication,
 		)
 	}
 }
