@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -153,16 +154,118 @@ func readEventLog(handle windows.Handle, readFlags, recordOffset uint32, buf []b
 
 type Config struct {
 	LogNames []string `yaml:"log_names"`
+	EventIDs []string `yaml:"event_ids"`
 }
 
 var ConfigDefaults = Config{
 	LogNames: []string{"Application", "System"},
+	EventIDs: []string{"15", "55", "41", "1000", "100", "400-499"},
+}
+
+// eventIDFilter stores parsed event IDs for efficient containment checks.
+type eventIDFilter struct {
+	ids    map[uint32]struct{}
+	ranges [][2]uint32
+}
+
+// newEventIDFilter parses a slice of event ID specs (e.g., "15", "400-499") into
+// a filter. A nil return value means no filtering – all event IDs are accepted.
+func newEventIDFilter(specs []string) (*eventIDFilter, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+
+	f := &eventIDFilter{
+		ids: make(map[uint32]struct{}),
+	}
+
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+
+		if idx := strings.Index(spec, "-"); idx != -1 {
+			lo, err := strconv.ParseUint(spec[:idx], 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
+			}
+
+			hi, err := strconv.ParseUint(spec[idx+1:], 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid event ID range %q: %w", spec, err)
+			}
+
+			if lo > hi {
+				return nil, fmt.Errorf("invalid event ID range %q: low > high", spec)
+			}
+
+			f.ranges = append(f.ranges, [2]uint32{uint32(lo), uint32(hi)})
+		} else {
+			id, err := strconv.ParseUint(spec, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid event ID %q: %w", spec, err)
+			}
+
+			f.ids[uint32(id)] = struct{}{}
+		}
+	}
+
+	return f, nil
+}
+
+// contains returns true if the event ID should be collected.
+func (f *eventIDFilter) contains(id uint32) bool {
+	if f == nil {
+		return true
+	}
+
+	if _, ok := f.ids[id]; ok {
+		return true
+	}
+
+	for _, r := range f.ranges {
+		if id >= r[0] && id <= r[1] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// extractSourceName reads the SourceName field (UTF-16LE, null-terminated) that
+// immediately follows the fixed-size EVENTLOGRECORD header.
+func extractSourceName(buf []byte, recordOffset, recLen uint32) string {
+	headerSize := uint32(unsafe.Sizeof(eventLogRecord{}))
+	start := recordOffset + headerSize
+	end := recordOffset + recLen
+
+	if int(end) > len(buf) {
+		end = uint32(len(buf))
+	}
+
+	if start+2 > end {
+		return ""
+	}
+
+	available := (end - start) / 2
+	nameWords := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[start])), available)
+
+	return windows.UTF16ToString(nameWords)
+}
+
+// eventKey is the composite key used to accumulate per-event counts.
+type eventKey struct {
+	eventType uint16
+	eventID   uint32
+	source    string
 }
 
 type Collector struct {
 	config Config
 	logger *slog.Logger
 
+	filter     *eventIDFilter
 	eventTotal *prometheus.Desc
 	logState   map[string]*logReadState
 }
@@ -170,7 +273,7 @@ type Collector struct {
 type logReadState struct {
 	handle           windows.Handle
 	nextRecordNumber uint32
-	counts           map[uint16]float64
+	counts           map[eventKey]float64
 }
 
 func New(config *Config) *Collector {
@@ -180,6 +283,10 @@ func New(config *Config) *Collector {
 
 	if config.LogNames == nil {
 		config.LogNames = ConfigDefaults.LogNames
+	}
+
+	if config.EventIDs == nil {
+		config.EventIDs = ConfigDefaults.EventIDs
 	}
 
 	return &Collector{config: *config}
@@ -197,8 +304,21 @@ func NewWithFlags(app *kingpin.Application) *Collector {
 		"Comma-separated list of Windows Event Log channels to collect. Defaults to Application and System.",
 	).Default(strings.Join(ConfigDefaults.LogNames, ",")).StringVar(&logNames)
 
+	var eventIDs string
+
+	app.Flag(
+		"collector.eventlog.event-ids",
+		"Comma-separated list of event IDs (or ranges, e.g. 400-499) to collect. Defaults to 15,55,41,1000,100,400-499. Empty string collects all event IDs.",
+	).Default(strings.Join(ConfigDefaults.EventIDs, ",")).StringVar(&eventIDs)
+
 	app.Action(func(*kingpin.ParseContext) error {
 		c.config.LogNames = strings.Split(logNames, ",")
+
+		if eventIDs == "" {
+			c.config.EventIDs = nil
+		} else {
+			c.config.EventIDs = strings.Split(eventIDs, ",")
+		}
 
 		return nil
 	})
@@ -213,10 +333,17 @@ func (c *Collector) GetName() string {
 func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.logger = logger.With(slog.String("collector", Name))
 
+	filter, err := newEventIDFilter(c.config.EventIDs)
+	if err != nil {
+		return fmt.Errorf("parse event ID filter: %w", err)
+	}
+
+	c.filter = filter
+
 	c.eventTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "event_total"),
 		"Total number of Windows Event Log events since the exporter started",
-		[]string{"channel", "level"},
+		[]string{"channel", "level", "event_id", "source"},
 		nil,
 	)
 
@@ -246,15 +373,10 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 			nextRecord = oldest + numRecords
 		}
 
-		counts := make(map[uint16]float64, len(eventLevelNames))
-		for eventType := range eventLevelNames {
-			counts[eventType] = 0
-		}
-
 		c.logState[logName] = &logReadState{
 			handle:           handle,
 			nextRecordNumber: nextRecord,
-			counts:           counts,
+			counts:           make(map[eventKey]float64),
 		}
 	}
 
@@ -326,7 +448,19 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 				break
 			}
 
-			state.counts[rec.EventType]++
+			// The low-order 16 bits of EventID contain the actual event ID.
+			eventID := rec.EventID & 0xFFFF
+
+			if c.filter.contains(eventID) {
+				source := extractSourceName(buf, offset, rec.Length)
+				key := eventKey{
+					eventType: rec.EventType,
+					eventID:   eventID,
+					source:    source,
+				}
+				state.counts[key]++
+			}
+
 			state.nextRecordNumber = rec.RecordNumber + 1
 			offset += rec.Length
 		}
@@ -342,13 +476,20 @@ func (c *Collector) reopenLog(_ string, state *logReadState) error {
 }
 
 func (c *Collector) emitCounts(ch chan<- prometheus.Metric, logName string, state *logReadState) {
-	for eventType, levelName := range eventLevelNames {
+	for key, count := range state.counts {
+		levelName, ok := eventLevelNames[key.eventType]
+		if !ok {
+			levelName = "unknown"
+		}
+
 		ch <- prometheus.MustNewConstMetric(
 			c.eventTotal,
 			prometheus.CounterValue,
-			state.counts[eventType],
+			count,
 			logName,
 			levelName,
+			strconv.FormatUint(uint64(key.eventID), 10),
+			key.source,
 		)
 	}
 }
