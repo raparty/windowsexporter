@@ -24,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus-community/windows_exporter/internal/headers/wevtapi"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +50,12 @@ const (
 )
 
 const initialReadBufferSize = 64 * 1024
+
+// Boot performance event constants
+const (
+	diagnosticsChannel = "Microsoft-Windows-Diagnostics-Performance/Operational"
+	bootPerfXPath      = "*[System[EventID=100]]"
+)
 
 //nolint:gochecknoglobals
 var eventLevelNames = map[uint16]string{
@@ -337,6 +344,12 @@ type Collector struct {
 	unexpectedShutdownCount *prometheus.Desc
 	kernelPowerCrashCount   *prometheus.Desc
 	appCrashTotal           *prometheus.Desc
+
+	// Boot performance metrics
+	bootTimeMs      *prometheus.Desc
+	mainPathBootTimeMs *prometheus.Desc
+	postBootTimeMs  *prometheus.Desc
+	bootStartupApps *prometheus.Desc
 }
 
 type logReadState struct {
@@ -449,6 +462,28 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		[]string{"application"}, nil,
 	)
 
+	// Boot performance metrics
+	c.bootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_time_ms"),
+		"Total boot duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootTime.",
+		nil, nil,
+	)
+	c.mainPathBootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "mainpath_boot_time_ms"),
+		"Main boot path duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field MainPathBootTime.",
+		nil, nil,
+	)
+	c.postBootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "post_boot_time_ms"),
+		"Post-boot duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootPostBootTime.",
+		nil, nil,
+	)
+	c.bootStartupApps = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_startup_apps"),
+		"Number of startup applications recorded during boot from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootNumStartupApps.",
+		nil, nil,
+	)
+
 	c.appCrashCounts = make(map[string]float64)
 
 	c.logState = make(map[string]*logReadState, len(c.config.LogNames))
@@ -516,6 +551,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	}
 
 	c.emitDerivedCounters(ch)
+	c.collectBootPerformanceMetrics(ch)
 
 	return nil
 }
@@ -683,4 +719,82 @@ func (c *Collector) emitDerivedCounters(ch chan<- prometheus.Metric) {
 	for appName, count := range c.appCrashCounts {
 		ch <- prometheus.MustNewConstMetric(c.appCrashTotal, prometheus.CounterValue, count, appName)
 	}
+}
+
+type bootPerformanceValues struct {
+	bootTime         *float64
+	mainPathBootTime *float64
+	postBootTime     *float64
+	startupApps      *float64
+}
+
+func parseBootPerformanceValues(fields map[string]string) (bootPerformanceValues, map[string]error) {
+	values := bootPerformanceValues{}
+	parseErrors := make(map[string]error)
+
+	parse := func(fieldName string) *float64 {
+		raw, ok := fields[fieldName]
+		if !ok {
+			return nil
+		}
+
+		value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			parseErrors[fieldName] = err
+
+			return nil
+		}
+
+		return &value
+	}
+
+	values.bootTime = parse("BootTime")
+	values.mainPathBootTime = parse("MainPathBootTime")
+	values.postBootTime = parse("BootPostBootTime")
+	values.startupApps = parse("BootNumStartupApps")
+
+	return values, parseErrors
+}
+
+// collectBootPerformanceMetrics queries only the newest Event ID 100 and emits
+// each available boot metric. Query and field errors never fail the scrape.
+func (c *Collector) collectBootPerformanceMetrics(ch chan<- prometheus.Metric) {
+	fields, err := wevtapi.QueryLatestEventData(diagnosticsChannel, bootPerfXPath)
+	if err != nil {
+		c.logger.Debug("failed to query boot performance metrics", slog.Any("err", err))
+
+		return
+	}
+
+	if fields == nil {
+		c.logger.Debug("no boot performance event found; skipping boot metrics")
+
+		return
+	}
+
+	values, parseErrors := parseBootPerformanceValues(fields)
+	for fieldName, parseErr := range parseErrors {
+		c.logger.Debug("failed to parse boot performance field",
+			slog.String("field", fieldName),
+			slog.String("raw", fields[fieldName]),
+			slog.Any("err", parseErr),
+		)
+	}
+
+	emit := func(desc *prometheus.Desc, fieldName string, value *float64) {
+		if value == nil {
+			if _, malformed := parseErrors[fieldName]; !malformed {
+				c.logger.Debug("boot performance field absent", slog.String("field", fieldName))
+			}
+
+			return
+		}
+
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, *value)
+	}
+
+	emit(c.bootTimeMs, "BootTime", values.bootTime)
+	emit(c.mainPathBootTimeMs, "MainPathBootTime", values.mainPathBootTime)
+	emit(c.postBootTimeMs, "BootPostBootTime", values.postBootTime)
+	emit(c.bootStartupApps, "BootNumStartupApps", values.startupApps)
 }
