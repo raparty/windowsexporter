@@ -1,12 +1,13 @@
 # eventlog collector
 
 The eventlog collector exposes counts of Windows Event Log entries per channel and event level,
-plus a set of focused stability counters for common failure events.
+plus a set of focused stability counters for common failure events. It also collects boot 
+performance metrics from the `Microsoft-Windows-Diagnostics-Performance/Operational` event log.
 
 |||
 -|-
-Metric name prefix  | `eventlog` (general) / none (derived counters)
-Data source         | Windows Event Log API (`advapi32.dll`)
+Metric name prefix  | `eventlog` (general) / none (derived counters and boot metrics)
+Data source         | Windows Event Log API (`advapi32.dll`) and Event Log API (`wevtapi.dll`)
 Enabled by default? | No
 
 ## Flags
@@ -53,6 +54,19 @@ Name | Description | Type | Source
 `windows_kernel_power_crash_count` | Total kernel-power crash events (BSOD / hard power loss) since the exporter started | counter | System log, Event 41
 `windows_app_crash_total` | Total application crashes grouped by faulting application name since the exporter started | counter | Application log, Event 1000 — label: `application`
 
+### Boot Performance Metrics
+
+These gauges reflect the most recent boot and remain constant until the next reboot. Values are 
+omitted entirely if the `Diagnostics-Performance` channel contains no events (e.g. on freshly 
+installed or stripped Windows SKUs).
+
+Name | Description | Type | Source
+-----|-------------|------|-------
+`windows_boot_time_ms` | Total boot duration in milliseconds | gauge | Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field `BootTime`
+`windows_mainpath_boot_time_ms` | Main boot path duration in milliseconds | gauge | Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field `MainPathBootTime`
+`windows_post_boot_time_ms` | Post-boot duration in milliseconds | gauge | Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field `BootPostBootTime`
+`windows_boot_startup_apps` | Number of startup applications that ran during the last boot | gauge | Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field `BootNumStartupApps`
+
 ### Label values
 
 **`channel`** (`windows_eventlog_event_total`): The Windows Event Log channel name, e.g. `Application`, `System`.
@@ -88,6 +102,12 @@ windows_kernel_power_crash_count 1
 windows_app_crash_total{application="Explorer.EXE"} 3
 windows_app_crash_total{application="SearchApp.exe"} 1
 windows_app_crash_total{application="ScreenSketch.exe"} 1
+
+# Boot performance metrics (collected shortly after a reboot)
+windows_boot_time_ms 133626
+windows_mainpath_boot_time_ms 54726
+windows_post_boot_time_ms 78900
+windows_boot_startup_apps 13
 ```
 
 ## Useful queries
@@ -114,6 +134,18 @@ topk(10, increase(windows_app_crash_total[24h]))
 
 ```promql
 increase(windows_unexpected_shutdown_count[7d]) > 0
+```
+
+### Last boot duration in seconds
+
+```promql
+windows_boot_time_ms / 1000
+```
+
+### Alert when boot takes longer than 60 seconds
+
+```promql
+windows_boot_time_ms > 60000
 ```
 
 ## Alerting examples
@@ -155,4 +187,45 @@ increase(windows_unexpected_shutdown_count[7d]) > 0
     annotations:
       summary: "Windows Event Log errors detected on {{ $labels.instance }}"
       description: "Event log channel '{{ $labels.channel }}' is recording errors."
+
+  - alert: "WindowsSlowBoot"
+    expr: "windows_boot_time_ms > 60000"
+    for: "0m"
+    labels:
+      severity: "warning"
+    annotations:
+      summary: "Slow Windows boot on {{ $labels.instance }}"
+      description: "Last boot took {{ $value | humanizeDuration }} (threshold: 60 s)."
+
+  - alert: "WindowsManyStartupApps"
+    expr: "windows_boot_startup_apps > 20"
+    for: "0m"
+    labels:
+      severity: "info"
+    annotations:
+      summary: "High startup-app count on {{ $labels.instance }}"
+      description: "{{ $value }} startup applications ran during the last boot."
 ```
+
+## Data source details
+
+### Classic Event Logs (Application, System)
+
+The eventlog collector uses the classic Windows Event Log API (`advapi32.dll`) to read from 
+`Application` and `System` logs as specified by `--collector.eventlog.log-names`.
+
+### Boot Performance Metrics
+
+Boot performance metrics are sourced from the `Microsoft-Windows-Diagnostics-Performance/Operational` 
+channel, which is written by the `Microsoft-Windows-Diagnostics-Performance` ETW provider. This 
+channel is **not** accessible via the classic `advapi32` API; it requires the modern Event Log API 
+(`wevtapi.dll`) introduced in Windows Vista.
+
+Event 100 (Boot Performance Measurement) is written once per boot and contains:
+
+| XML field | Description |
+|---|---|
+| `BootTime` | Total time from firmware hand-off to OS ready, in milliseconds |
+| `MainPathBootTime` | Main boot path duration, in milliseconds |
+| `BootPostBootTime` | Duration of post-boot startup activities, in milliseconds |
+| `BootNumStartupApps` | Number of startup programs that ran during this boot |
