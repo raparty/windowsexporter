@@ -36,6 +36,8 @@ func TestParseBootPerformanceValues(t *testing.T) {
     <Data Name="MainPathBootTime">54726</Data>
     <Data Name="BootPostBootTime">78900</Data>
     <Data Name="BootNumStartupApps">13</Data>
+    <Data Name="BootDriverInitTime">8537</Data>
+    <Data Name="BootUserProfileProcessingTime">2371</Data>
   </EventData>
 </Event>`
 
@@ -56,6 +58,12 @@ func TestParseBootPerformanceValues(t *testing.T) {
 
 	require.NotNil(t, values.startupApps)
 	assert.InDelta(t, 13, *values.startupApps, 0)
+
+	require.NotNil(t, values.driverInitTime)
+	assert.InDelta(t, 8537, *values.driverInitTime, 0)
+
+	require.NotNil(t, values.userProfileTime)
+	assert.InDelta(t, 2371, *values.userProfileTime, 0)
 }
 
 func TestParseBootPerformanceValuesOmitsInvalidFields(t *testing.T) {
@@ -72,4 +80,20 @@ func TestParseBootPerformanceValuesOmitsInvalidFields(t *testing.T) {
 	require.NotNil(t, values.mainPathBootTime)
 	require.NotNil(t, values.startupApps)
 	assert.Contains(t, parseErrors, "BootTime")
+}
+
+func TestParseBootPerformanceValuesRetainsZero(t *testing.T) {
+	t.Parallel()
+
+	values, parseErrors := parseBootPerformanceValues(map[string]string{
+		"BootDriverInitTime":              "0",
+		"BootUserProfileProcessingTime":   "0",
+	})
+	require.Empty(t, parseErrors)
+
+	require.NotNil(t, values.driverInitTime)
+	assert.InDelta(t, 0, *values.driverInitTime, 0)
+
+	require.NotNil(t, values.userProfileTime)
+	assert.InDelta(t, 0, *values.userProfileTime, 0)
 }
