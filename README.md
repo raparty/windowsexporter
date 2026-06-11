@@ -269,6 +269,19 @@ log:
 
 CLI flags enjoy a higher priority over values specified in the configuration file.
 
+## Boot Performance Metrics
+
+The EventLog collector exports boot performance data from
+`Microsoft-Windows-Diagnostics-Performance/Operational`, using the most recent
+Event ID `100`.
+
+| Metric | Description |
+|--------|-------------|
+| `windows_boot_time_ms` | Total boot duration in milliseconds. |
+| `windows_mainpath_boot_time_ms` | Main boot path duration in milliseconds. |
+| `windows_post_boot_time_ms` | Post-boot duration in milliseconds. |
+| `windows_boot_startup_apps` | Number of startup applications recorded during boot. |
+
 ## License
 
 Under [MIT](LICENSE)

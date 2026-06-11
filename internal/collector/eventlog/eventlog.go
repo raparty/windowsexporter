@@ -721,45 +721,80 @@ func (c *Collector) emitDerivedCounters(ch chan<- prometheus.Metric) {
 	}
 }
 
-// collectBootPerformanceMetrics queries the most recent boot performance event
-// and emits the boot-timing gauges. If no event exists the metrics are omitted
-// rather than emitting zero, so stale data is never presented.
+type bootPerformanceValues struct {
+	bootTime         *float64
+	mainPathBootTime *float64
+	postBootTime     *float64
+	startupApps      *float64
+}
+
+func parseBootPerformanceValues(fields map[string]string) (bootPerformanceValues, map[string]error) {
+	values := bootPerformanceValues{}
+	parseErrors := make(map[string]error)
+
+	parse := func(fieldName string) *float64 {
+		raw, ok := fields[fieldName]
+		if !ok {
+			return nil
+		}
+
+		value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			parseErrors[fieldName] = err
+
+			return nil
+		}
+
+		return &value
+	}
+
+	values.bootTime = parse("BootTime")
+	values.mainPathBootTime = parse("MainPathBootTime")
+	values.postBootTime = parse("BootPostBootTime")
+	values.startupApps = parse("BootNumStartupApps")
+
+	return values, parseErrors
+}
+
+// collectBootPerformanceMetrics queries only the newest Event ID 100 and emits
+// each available boot metric. Query and field errors never fail the scrape.
 func (c *Collector) collectBootPerformanceMetrics(ch chan<- prometheus.Metric) {
 	fields, err := wevtapi.QueryLatestEventData(diagnosticsChannel, bootPerfXPath)
 	if err != nil {
 		c.logger.Debug("failed to query boot performance metrics", slog.Any("err", err))
+
 		return
 	}
 
 	if fields == nil {
-		// The Diagnostics-Performance log is empty or the channel is not
-		// available on this system (e.g. stripped/server SKUs). Skip silently.
 		c.logger.Debug("no boot performance event found; skipping boot metrics")
+
 		return
 	}
 
-	emitBootGauge := func(desc *prometheus.Desc, fieldName string) {
-		raw, ok := fields[fieldName]
-		if !ok {
-			c.logger.Debug("boot event field absent", slog.String("field", fieldName))
-			return
-		}
-
-		val, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-		if parseErr != nil {
-			c.logger.Warn("unparseable boot event field",
-				slog.String("field", fieldName),
-				slog.String("raw", raw),
-				slog.Any("err", parseErr),
-			)
-			return
-		}
-
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+	values, parseErrors := parseBootPerformanceValues(fields)
+	for fieldName, parseErr := range parseErrors {
+		c.logger.Debug("failed to parse boot performance field",
+			slog.String("field", fieldName),
+			slog.String("raw", fields[fieldName]),
+			slog.Any("err", parseErr),
+		)
 	}
 
-	emitBootGauge(c.bootTimeMs, "BootTime")
-	emitBootGauge(c.mainPathBootTimeMs, "MainPathBootTime")
-	emitBootGauge(c.postBootTimeMs, "BootPostBootTime")
-	emitBootGauge(c.bootStartupApps, "BootNumStartupApps")
+	emit := func(desc *prometheus.Desc, fieldName string, value *float64) {
+		if value == nil {
+			if _, malformed := parseErrors[fieldName]; !malformed {
+				c.logger.Debug("boot performance field absent", slog.String("field", fieldName))
+			}
+
+			return
+		}
+
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, *value)
+	}
+
+	emit(c.bootTimeMs, "BootTime", values.bootTime)
+	emit(c.mainPathBootTimeMs, "MainPathBootTime", values.mainPathBootTime)
+	emit(c.postBootTimeMs, "BootPostBootTime", values.postBootTime)
+	emit(c.bootStartupApps, "BootNumStartupApps", values.startupApps)
 }

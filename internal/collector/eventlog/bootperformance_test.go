@@ -17,83 +17,59 @@ package eventlog
 
 import (
 	"testing"
+
+	"github.com/prometheus-community/windows_exporter/internal/headers/wevtapi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// TestBootPerformanceMetrics verifies parsing of boot performance XML data.
-func TestBootPerformanceMetrics(t *testing.T) {
+func TestParseBootPerformanceValues(t *testing.T) {
 	t.Parallel()
 
-	// Sample Event ID 100 XML payload containing boot performance data
-	sampleEventData := map[string]string{
-		"BootTime":         "133626",
-		"MainPathBootTime": "54726",
-		"BootPostBootTime": "78900",
-		"BootNumStartupApps": "13",
-	}
+	const eventXML = `<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Diagnostics-Performance"/>
+    <EventID>100</EventID>
+  </System>
+  <EventData>
+    <Data Name="BootTime">133626</Data>
+    <Data Name="MainPathBootTime">54726</Data>
+    <Data Name="BootPostBootTime">78900</Data>
+    <Data Name="BootNumStartupApps">13</Data>
+  </EventData>
+</Event>`
 
-	tests := []struct {
-		name     string
-		fieldName string
-		expected float64
-	}{
-		{
-			name:      "BootTime",
-			fieldName: "BootTime",
-			expected:  133626.0,
-		},
-		{
-			name:      "MainPathBootTime",
-			fieldName: "MainPathBootTime",
-			expected:  54726.0,
-		},
-		{
-			name:      "BootPostBootTime",
-			fieldName: "BootPostBootTime",
-			expected:  78900.0,
-		},
-		{
-			name:      "BootNumStartupApps",
-			fieldName: "BootNumStartupApps",
-			expected:  13.0,
-		},
-	}
+	fields, err := wevtapi.ParseEventDataXML([]byte(eventXML))
+	require.NoError(t, err)
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	values, parseErrors := parseBootPerformanceValues(fields)
+	require.Empty(t, parseErrors)
 
-			raw, ok := sampleEventData[tc.fieldName]
-			if !ok {
-				t.Fatalf("field %q not found in sample data", tc.fieldName)
-			}
+	require.NotNil(t, values.bootTime)
+	assert.Equal(t, float64(133626), *values.bootTime)
 
-			val := 0.0
-			n, err := len(raw), error(nil)
-			if err != nil {
-				t.Fatalf("field %q: unexpected error: %v", tc.fieldName, err)
-			}
+	require.NotNil(t, values.mainPathBootTime)
+	assert.Equal(t, float64(54726), *values.mainPathBootTime)
 
-			if n > 0 {
-				// Parse the field as a float
-				var parsed float64
-				_, err := parseBootFloat(raw, &parsed)
-				if err != nil {
-					t.Fatalf("field %q: failed to parse %q: %v", tc.fieldName, raw, err)
-				}
-				val = parsed
-			}
+	require.NotNil(t, values.postBootTime)
+	assert.Equal(t, float64(78900), *values.postBootTime)
 
-			if val != tc.expected {
-				t.Errorf("field %q: got %v, expected %v", tc.fieldName, val, tc.expected)
-			}
-		})
-	}
+	require.NotNil(t, values.startupApps)
+	assert.Equal(t, float64(13), *values.startupApps)
 }
 
-// parseBootFloat is a helper to parse boot performance field values
-func parseBootFloat(raw string, result *float64) (int, error) {
-	// Simplified parser - in real code this would use strconv.ParseFloat
-	// This is just for the test structure
-	*result = 0
-	return len(raw), nil
+func TestParseBootPerformanceValuesOmitsInvalidFields(t *testing.T) {
+	t.Parallel()
+
+	values, parseErrors := parseBootPerformanceValues(map[string]string{
+		"BootTime":           "not-a-number",
+		"MainPathBootTime":   "54726",
+		"BootNumStartupApps": "13",
+	})
+
+	assert.Nil(t, values.bootTime)
+	assert.Nil(t, values.postBootTime)
+	require.NotNil(t, values.mainPathBootTime)
+	require.NotNil(t, values.startupApps)
+	assert.Contains(t, parseErrors, "BootTime")
 }
