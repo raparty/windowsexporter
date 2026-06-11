@@ -346,10 +346,12 @@ type Collector struct {
 	appCrashTotal           *prometheus.Desc
 
 	// Boot performance metrics
-	bootTimeMs         *prometheus.Desc
-	mainPathBootTimeMs *prometheus.Desc
-	postBootTimeMs     *prometheus.Desc
-	bootStartupApps    *prometheus.Desc
+	bootTimeMs            *prometheus.Desc
+	mainPathBootTimeMs    *prometheus.Desc
+	postBootTimeMs        *prometheus.Desc
+	bootStartupApps       *prometheus.Desc
+	bootDriverInitTimeMs  *prometheus.Desc
+	bootUserProfileTimeMs *prometheus.Desc
 }
 
 type logReadState struct {
@@ -481,6 +483,16 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.bootStartupApps = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "boot_startup_apps"),
 		"Number of startup applications recorded during boot from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootNumStartupApps.",
+		nil, nil,
+	)
+	c.bootDriverInitTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_driver_init_time_ms"),
+		"Driver initialization duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootDriverInitTime.",
+		nil, nil,
+	)
+	c.bootUserProfileTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_user_profile_time_ms"),
+		"User profile processing duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootUserProfileProcessingTime.",
 		nil, nil,
 	)
 
@@ -722,10 +734,12 @@ func (c *Collector) emitDerivedCounters(ch chan<- prometheus.Metric) {
 }
 
 type bootPerformanceValues struct {
-	bootTime         *float64
+	bootTime        *float64
 	mainPathBootTime *float64
-	postBootTime     *float64
-	startupApps      *float64
+	postBootTime    *float64
+	startupApps     *float64
+	driverInitTime  *float64
+	userProfileTime *float64
 }
 
 func parseBootPerformanceValues(fields map[string]string) (bootPerformanceValues, map[string]error) {
@@ -752,6 +766,8 @@ func parseBootPerformanceValues(fields map[string]string) (bootPerformanceValues
 	values.mainPathBootTime = parse("MainPathBootTime")
 	values.postBootTime = parse("BootPostBootTime")
 	values.startupApps = parse("BootNumStartupApps")
+	values.driverInitTime = parse("BootDriverInitTime")
+	values.userProfileTime = parse("BootUserProfileProcessingTime")
 
 	return values, parseErrors
 }
@@ -797,4 +813,6 @@ func (c *Collector) collectBootPerformanceMetrics(ch chan<- prometheus.Metric) {
 	emit(c.mainPathBootTimeMs, "MainPathBootTime", values.mainPathBootTime)
 	emit(c.postBootTimeMs, "BootPostBootTime", values.postBootTime)
 	emit(c.bootStartupApps, "BootNumStartupApps", values.startupApps)
+	emit(c.bootDriverInitTimeMs, "BootDriverInitTime", values.driverInitTime)
+	emit(c.bootUserProfileTimeMs, "BootUserProfileProcessingTime", values.userProfileTime)
 }
