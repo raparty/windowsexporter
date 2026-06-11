@@ -39,23 +39,23 @@ func TestParseBootPerformanceValues(t *testing.T) {
   </EventData>
 </Event>`
 
-	fields, err := wevtapi.ParseEventDataXML([]byte(eventXML))
+	fields, err := wevtapi.ParseEventXML(eventXML)
 	require.NoError(t, err)
 
 	values, parseErrors := parseBootPerformanceValues(fields)
 	require.Empty(t, parseErrors)
 
 	require.NotNil(t, values.bootTime)
-	assert.Equal(t, float64(133626), *values.bootTime)
+	assert.InDelta(t, 133626, *values.bootTime, 0)
 
 	require.NotNil(t, values.mainPathBootTime)
-	assert.Equal(t, float64(54726), *values.mainPathBootTime)
+	assert.InDelta(t, 54726, *values.mainPathBootTime, 0)
 
 	require.NotNil(t, values.postBootTime)
-	assert.Equal(t, float64(78900), *values.postBootTime)
+	assert.InDelta(t, 78900, *values.postBootTime, 0)
 
 	require.NotNil(t, values.startupApps)
-	assert.Equal(t, float64(13), *values.startupApps)
+	assert.InDelta(t, 13, *values.startupApps, 0)
 }
 
 func TestParseBootPerformanceValuesOmitsInvalidFields(t *testing.T) {

@@ -346,10 +346,10 @@ type Collector struct {
 	appCrashTotal           *prometheus.Desc
 
 	// Boot performance metrics
-	bootTimeMs      *prometheus.Desc
+	bootTimeMs         *prometheus.Desc
 	mainPathBootTimeMs *prometheus.Desc
-	postBootTimeMs  *prometheus.Desc
-	bootStartupApps *prometheus.Desc
+	postBootTimeMs     *prometheus.Desc
+	bootStartupApps    *prometheus.Desc
 }
 
 type logReadState struct {
@@ -760,14 +760,14 @@ func parseBootPerformanceValues(fields map[string]string) (bootPerformanceValues
 // each available boot metric. Query and field errors never fail the scrape.
 func (c *Collector) collectBootPerformanceMetrics(ch chan<- prometheus.Metric) {
 	fields, err := wevtapi.QueryLatestEventData(diagnosticsChannel, bootPerfXPath)
-	if err != nil {
-		c.logger.Debug("failed to query boot performance metrics", slog.Any("err", err))
+	if errors.Is(err, wevtapi.ErrNoMatchingEvents) {
+		c.logger.Debug("no boot performance event found; skipping boot metrics")
 
 		return
 	}
 
-	if fields == nil {
-		c.logger.Debug("no boot performance event found; skipping boot metrics")
+	if err != nil {
+		c.logger.Debug("failed to query boot performance metrics", slog.Any("err", err))
 
 		return
 	}

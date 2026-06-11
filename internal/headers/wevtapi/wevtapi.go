@@ -19,11 +19,16 @@
 package wevtapi
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// ErrNoMatchingEvents indicates that a query returned no event records.
+//nolint:gochecknoglobals
+var ErrNoMatchingEvents = errors.New("no matching events")
 
 // EvtQuery flags.
 const (
@@ -47,7 +52,7 @@ var (
 
 // QueryLatestEventData queries the named Windows Event Log channel for the
 // most recent event matching the XPath query string and returns the EventData
-// fields as a Name→Value map. Returns nil, nil when no matching event exists.
+// fields as a Name→Value map. It returns ErrNoMatchingEvents when no match exists.
 func QueryLatestEventData(channel, query string) (map[string]string, error) {
 	channelPtr, err := windows.UTF16PtrFromString(channel)
 	if err != nil {
@@ -84,15 +89,15 @@ func QueryLatestEventData(channel, query string) (map[string]string, error) {
 		uintptr(unsafe.Pointer(&returned)),
 	)
 	if ret == 0 {
-		if callErr == errNoMoreItems {
-			return nil, nil // channel has no matching events
+		if errors.Is(callErr, errNoMoreItems) {
+			return nil, ErrNoMatchingEvents
 		}
 
 		return nil, fmt.Errorf("EvtNext: %w", callErr)
 	}
 
 	if returned == 0 {
-		return nil, nil
+		return nil, ErrNoMatchingEvents
 	}
 
 	defer procEvtClose.Call(uintptr(eventHandle)) //nolint:errcheck
@@ -132,21 +137,4 @@ func renderEventData(eventHandle windows.Handle) (map[string]string, error) {
 	}
 
 	return ParseEventXML(windows.UTF16ToString(buf))
-	return ParseEventDataXML([]byte(windows.UTF16ToString(buf)))
-}
-
-// ParseEventDataXML extracts EventData Name-to-value pairs from rendered event XML.
-func ParseEventDataXML(data []byte) (map[string]string, error) {
-	var ev eventXML
-	if err := xml.Unmarshal(data, &ev); err != nil {
-		return nil, fmt.Errorf("parse event XML: %w", err)
-	}
-
-	fields := make(map[string]string, len(ev.EventData.Data))
-
-	for _, eventData := range ev.EventData.Data {
-		fields[eventData.Name] = eventData.Value
-	}
-
-	return fields, nil
 }
