@@ -5,7 +5,7 @@ The bootperformance collector exposes Windows boot-performance timing metrics de
 
 On every scrape the most recent **Boot Performance Measurement** event (Event ID 100) is read
 via the modern Windows Event Log API (`EvtQuery` / `EvtNext` / `EvtRender` from `wevtapi.dll`)
-and three fields are extracted from the XML payload and emitted as gauges.
+and four fields are extracted from the XML payload and emitted as gauges.
 
 |||
 -|-
@@ -23,6 +23,7 @@ No collector-specific flags. Enable with `--collectors.enabled=bootperformance`.
 Name | Description | Type | Labels
 -----|-------------|------|-------
 `windows_boot_time_ms` | Total boot duration in milliseconds (`BootTime` field in Event 100) | gauge | —
+`windows_mainpath_boot_time_ms` | Main boot path duration in milliseconds (`MainPathBootTime` field in Event 100) | gauge | —
 `windows_post_boot_time_ms` | Post-boot phase duration in milliseconds (`BootPostBootTime` field in Event 100) | gauge | —
 `windows_boot_startup_apps` | Number of startup applications that ran during the last boot (`BootNumStartupApps` field in Event 100) | gauge | —
 
@@ -42,6 +43,7 @@ Event 100 is written once per boot and contains (among others):
 | XML field | Description |
 |---|---|
 | `BootTime` | Total time from firmware hand-off to OS ready, in milliseconds |
+| `MainPathBootTime` | Time spent on the critical boot path (kernel + session init), in milliseconds |
 | `BootPostBootTime` | Duration of post-boot startup activities, in milliseconds |
 | `BootNumStartupApps` | Number of startup programs that ran during this boot |
 
@@ -49,9 +51,10 @@ Event 100 is written once per boot and contains (among others):
 
 ```
 # Collected shortly after a reboot
-windows_boot_time_ms 28432
-windows_post_boot_time_ms 7812
-windows_boot_startup_apps 4
+windows_boot_time_ms 133626
+windows_mainpath_boot_time_ms 54726
+windows_post_boot_time_ms 78900
+windows_boot_startup_apps 13
 ```
 
 ## Useful queries
@@ -60,6 +63,12 @@ windows_boot_startup_apps 4
 
 ```promql
 windows_boot_time_ms / 1000
+```
+
+### Main path vs post-boot breakdown
+
+```promql
+windows_mainpath_boot_time_ms / windows_boot_time_ms
 ```
 
 ### Alert when boot takes longer than 60 seconds
@@ -103,7 +112,10 @@ windows_boot_startup_apps
 # Cross-compile (from Linux or macOS)
 GOOS=windows GOARCH=amd64 go build ./internal/collector/bootperformance/...
 
-# Run tests on a Windows host
+# Run XML parsing unit tests (cross-platform, no Windows required)
+go test -v -run TestParseBootEvent100 ./internal/collector/bootperformance/...
+
+# Run integration tests on a Windows host
 go test -v ./internal/collector/bootperformance/...
 
 # Benchmark
