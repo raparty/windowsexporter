@@ -13,6 +13,9 @@
 
 //go:build windows
 
+// Package wevtapi provides a thin wrapper around the Windows Event Log API
+// (wevtapi.dll) for querying channel-based (ETW/EVTX) event logs that are not
+// accessible via the classic advapi32 OpenEventLog/ReadEventLog interface.
 package wevtapi
 
 import (
@@ -23,13 +26,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// EvtQuery flags.
 const (
-	EvtQueryChannelPath      uint32 = 0x00000001
-	EvtQueryReverseDirection uint32 = 0x00000200
-	EvtRenderEventXml        uint32 = 1
+	evtQueryChannelPath      uint32 = 0x00000001
+	evtQueryReverseDirection uint32 = 0x00000200
+	evtRenderEventXml        uint32 = 1
 
-	// ERROR_NO_MORE_ITEMS is returned by EvtNext when there are no more events.
-	errorNoMoreItems = windows.Errno(259)
+	// errNoMoreItems is the Win32 error code returned by EvtNext when the
+	// result set is exhausted.
+	errNoMoreItems = windows.Errno(259)
 )
 
 //nolint:gochecknoglobals
@@ -41,8 +46,9 @@ var (
 	procEvtClose  = modWevtapi.NewProc("EvtClose")
 )
 
-// eventDataXML is a minimal representation of a Windows Event Log event XML envelope.
-type eventDataXML struct {
+// eventXML is a minimal representation of a Windows Event Log XML envelope,
+// used only to extract EventData Name→Value pairs.
+type eventXML struct {
 	XMLName   xml.Name `xml:"Event"`
 	EventData struct {
 		Data []struct {
@@ -52,25 +58,25 @@ type eventDataXML struct {
 	} `xml:"EventData"`
 }
 
-// QueryLatestEventData queries a Windows Event Log channel for the most recent
-// event matching the XPath query and returns EventData Name→Value pairs.
-// Returns nil, nil when no matching events exist in the channel.
+// QueryLatestEventData queries the named Windows Event Log channel for the
+// most recent event matching the XPath query string and returns the EventData
+// fields as a Name→Value map. Returns nil, nil when no matching event exists.
 func QueryLatestEventData(channel, query string) (map[string]string, error) {
 	channelPtr, err := windows.UTF16PtrFromString(channel)
 	if err != nil {
-		return nil, fmt.Errorf("convert channel name: %w", err)
+		return nil, fmt.Errorf("encode channel name: %w", err)
 	}
 
 	queryPtr, err := windows.UTF16PtrFromString(query)
 	if err != nil {
-		return nil, fmt.Errorf("convert query string: %w", err)
+		return nil, fmt.Errorf("encode query string: %w", err)
 	}
 
 	queryHandle, _, callErr := procEvtQuery.Call(
-		0,
+		0, // local session
 		uintptr(unsafe.Pointer(channelPtr)),
 		uintptr(unsafe.Pointer(queryPtr)),
-		uintptr(EvtQueryChannelPath|EvtQueryReverseDirection),
+		uintptr(evtQueryChannelPath|evtQueryReverseDirection),
 	)
 	if queryHandle == 0 {
 		return nil, fmt.Errorf("EvtQuery: %w", callErr)
@@ -86,13 +92,13 @@ func QueryLatestEventData(channel, query string) (map[string]string, error) {
 		queryHandle,
 		1,
 		uintptr(unsafe.Pointer(&eventHandle)),
-		2000,
-		0,
+		2000, // timeout in milliseconds
+		0,    // reserved flags
 		uintptr(unsafe.Pointer(&returned)),
 	)
 	if ret == 0 {
-		if callErr == errorNoMoreItems {
-			return nil, nil
+		if callErr == errNoMoreItems {
+			return nil, nil // channel has no matching events
 		}
 
 		return nil, fmt.Errorf("EvtNext: %w", callErr)
@@ -104,25 +110,32 @@ func QueryLatestEventData(channel, query string) (map[string]string, error) {
 
 	defer procEvtClose.Call(uintptr(eventHandle)) //nolint:errcheck
 
+	return renderEventData(eventHandle)
+}
+
+// renderEventData renders an event handle as XML and returns its EventData fields.
+func renderEventData(eventHandle windows.Handle) (map[string]string, error) {
 	buf := make([]uint16, 8192)
 
 	var bufUsed, propCount uint32
 
 	for {
-		ret, _, callErr = procEvtRender.Call(
-			0,
+		ret, _, callErr := procEvtRender.Call(
+			0, // NULL context for XML rendering
 			uintptr(eventHandle),
-			uintptr(EvtRenderEventXml),
+			uintptr(evtRenderEventXml),
 			uintptr(len(buf)*2),
 			uintptr(unsafe.Pointer(&buf[0])),
 			uintptr(unsafe.Pointer(&bufUsed)),
 			uintptr(unsafe.Pointer(&propCount)),
 		)
+
 		if ret != 0 {
 			break
 		}
 
 		if bufUsed > uint32(len(buf)*2) {
+			// Buffer too small — grow to the size Windows told us we need.
 			buf = make([]uint16, bufUsed/2+1)
 
 			continue
@@ -133,16 +146,16 @@ func QueryLatestEventData(channel, query string) (map[string]string, error) {
 
 	xmlStr := windows.UTF16ToString(buf)
 
-	var ev eventDataXML
-	if xmlErr := xml.Unmarshal([]byte(xmlStr), &ev); xmlErr != nil {
-		return nil, fmt.Errorf("parse event XML: %w", xmlErr)
+	var ev eventXML
+	if err := xml.Unmarshal([]byte(xmlStr), &ev); err != nil {
+		return nil, fmt.Errorf("parse event XML: %w", err)
 	}
 
-	result := make(map[string]string, len(ev.EventData.Data))
+	fields := make(map[string]string, len(ev.EventData.Data))
 
 	for _, d := range ev.EventData.Data {
-		result[d.Name] = d.Value
+		fields[d.Name] = d.Value
 	}
 
-	return result, nil
+	return fields, nil
 }

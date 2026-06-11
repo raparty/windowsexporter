@@ -13,12 +13,15 @@
 
 //go:build windows
 
-// Package winhealth collects Windows health and stability metrics.
+// Package winhealth collects Windows system health and stability metrics.
 //
-// All boot metrics (boot time, post-boot time, startup app count) are read
-// from Diagnostics-Performance Event ID 100. Crash/hang/shutdown counters
-// are accumulated from the Application and System classic event logs.
-// Pending-reboot status is derived from well-known registry keys.
+// Boot performance metrics are sourced from the
+// Microsoft-Windows-Diagnostics-Performance/Operational channel (Event 100),
+// which records BootTime, BootPostBootTime, and BootNumStartupApps for every
+// boot. Stability counters (crashes, hangs, shutdowns) accumulate new entries
+// from the classic Application and System event logs using the advapi32
+// sequential-read API. A pending-reboot indicator is derived from well-known
+// registry keys updated by Windows Update, CBS, and installers.
 package winhealth
 
 import (
@@ -38,44 +41,49 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// Name is the collector name used for registration and logging.
+// Name is the collector identifier used for registration, logging, and
+// the --collectors.enabled flag.
 const Name = "winhealth"
 
-// diagnosticsPerformanceChannel is the ETW channel that contains boot timing events.
-const diagnosticsPerformanceChannel = "Microsoft-Windows-Diagnostics-Performance/Operational"
+// diagnosticsChannel is the ETW/EVTX channel that records boot performance
+// events. It is a modern channel-based log, not accessible via advapi32.
+const diagnosticsChannel = "Microsoft-Windows-Diagnostics-Performance/Operational"
 
-// eventIDBootPerf is the Diagnostics-Performance event that carries all boot
-// timing fields: BootTime, BootPostBootTime, and BootNumStartupApps.
-const eventIDBootPerf uint32 = 100
+// bootPerfXPath selects the Boot Performance Measurement event. All three boot
+// metrics are extracted from a single record of this type.
+const bootPerfXPath = "*[System[EventID=100]]"
 
-// Classic event log event IDs accumulated as Prometheus counters.
+// Classic event log event IDs monitored as Prometheus counters.
+// These events appear in the Application or System log and are read via advapi32.
 const (
-	eventIDKernelPowerCrash    uint32 = 41   // System log — unexpected restart (BSOD / hard power loss)
-	eventIDApplicationError    uint32 = 1000 // Application log — application crash
-	eventIDApplicationHang     uint32 = 1002 // Application log — application hang
-	eventIDDisplayTDR          uint32 = 4101 // System log — display driver TDR recovery
-	eventIDUnexpectedShutdown  uint32 = 6008 // System log — previous shutdown was unexpected
+	eventIDKernelPowerCrash   uint32 = 41   // System  — unexpected power loss / BSOD restart
+	eventIDApplicationError   uint32 = 1000 // App     — faulting application (crash)
+	eventIDApplicationHang    uint32 = 1002 // App     — application not responding
+	eventIDDisplayTDR         uint32 = 4101 // System  — display driver timeout & recovery
+	eventIDUnexpectedShutdown uint32 = 6008 // System  — previous shutdown was unexpected
 )
 
-// advapi32 sequential-read flags (mirrors eventlog collector).
+// advapi32 ReadEventLog flags (mirrors internal/collector/eventlog/eventlog.go).
 const (
-	eventlogSequentialRead uint32 = 0x0001
-	eventlogForwardsRead   uint32 = 0x0004
-	utf16CharSize          uint32 = 2
-	initialReadBufferSize         = 64 * 1024
+	evtlogSequentialRead  uint32 = 0x0001
+	evtlogForwardsRead    uint32 = 0x0004
+	utf16CharSize         uint32 = 2
+	initialReadBufferSize        = 64 * 1024
 )
 
 //nolint:gochecknoglobals
 var (
-	modadvapi32                    = windows.NewLazySystemDLL("advapi32.dll")
-	procOpenEventLogW              = modadvapi32.NewProc("OpenEventLogW")
-	procCloseEventLog              = modadvapi32.NewProc("CloseEventLog")
-	procGetNumberOfEventLogRecords = modadvapi32.NewProc("GetNumberOfEventLogRecords")
-	procGetOldestEventLogRecord    = modadvapi32.NewProc("GetOldestEventLogRecord")
-	procReadEventLogW              = modadvapi32.NewProc("ReadEventLogW")
+	modAdvapi32                    = windows.NewLazySystemDLL("advapi32.dll")
+	procOpenEventLogW              = modAdvapi32.NewProc("OpenEventLogW")
+	procCloseEventLog              = modAdvapi32.NewProc("CloseEventLog")
+	procGetNumberOfEventLogRecords = modAdvapi32.NewProc("GetNumberOfEventLogRecords")
+	procGetOldestEventLogRecord    = modAdvapi32.NewProc("GetOldestEventLogRecord")
+	procReadEventLogW              = modAdvapi32.NewProc("ReadEventLogW")
 )
 
-// eventLogRecord mirrors the Win32 EVENTLOGRECORD fixed-size header.
+// eventLogRecord mirrors the fixed-size EVENTLOGRECORD header defined in
+// <winnt.h>. Variable-length fields (source name, strings, data) immediately
+// follow this header in the buffer returned by ReadEventLog.
 type eventLogRecord struct {
 	Length              uint32
 	Reserved            uint32
@@ -95,34 +103,35 @@ type eventLogRecord struct {
 	DataOffset          uint32
 }
 
-// logReadState tracks the per-log read cursor used in Collect.
-type logReadState struct {
+// logState holds the open handle and sequential read cursor for one event log.
+type logState struct {
 	handle           windows.Handle
 	nextRecordNumber uint32
 }
 
-// Config holds collector configuration (currently empty; reserved for future flags).
+// Config holds collector-level configuration. Currently no tuneable options
+// are exposed; the struct is reserved for future use.
 type Config struct{}
 
 //nolint:gochecknoglobals
 var ConfigDefaults = Config{}
 
-// Collector implements the winhealth Prometheus collector.
+// Collector is the winhealth Prometheus collector.
 type Collector struct {
 	config Config
 	logger *slog.Logger
 
-	appLogState *logReadState
-	sysLogState *logReadState
+	appLog *logState // Application log — crashes and hangs
+	sysLog *logState // System log — display TDR, unexpected shutdown, kernel power
 
-	// running counters updated each Collect
+	// Cumulative counters incremented on each Collect call.
 	explorerCrashTotal     float64
 	appHangTotal           float64
 	displayResetTotal      float64
 	unexpectedShutdownTotal float64
 	kernelPowerCrashTotal  float64
 
-	// metric descriptors
+	// Prometheus metric descriptors.
 	bootTimeMs             *prometheus.Desc
 	postBootTimeMs         *prometheus.Desc
 	bootStartupApps        *prometheus.Desc
@@ -148,94 +157,121 @@ func NewWithFlags(_ *kingpin.Application) *Collector {
 
 func (c *Collector) GetName() string { return Name }
 
+// Close releases open event log handles.
 func (c *Collector) Close() error {
-	if c.appLogState != nil && c.appLogState.handle != 0 {
-		_ = closeEventLog(c.appLogState.handle)
+	var errs []error
+
+	if c.appLog != nil && c.appLog.handle != 0 {
+		if err := closeEventLog(c.appLog.handle); err != nil {
+			errs = append(errs, fmt.Errorf("close Application log: %w", err))
+		}
 	}
 
-	if c.sysLogState != nil && c.sysLogState.handle != 0 {
-		_ = closeEventLog(c.sysLogState.handle)
+	if c.sysLog != nil && c.sysLog.handle != 0 {
+		if err := closeEventLog(c.sysLog.handle); err != nil {
+			errs = append(errs, fmt.Errorf("close System log: %w", err))
+		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
+// Build initialises metric descriptors and opens the event log handles.
+// The miSession parameter is part of the Collector interface but is not used
+// by this collector.
 func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.logger = logger.With(slog.String("collector", Name))
 
-	// All three boot metrics are read from Diagnostics-Performance Event 100.
+	// ── Boot performance (all from Diagnostics-Performance Event 100) ──────────
 	c.bootTimeMs = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "boot_time_ms"),
-		"Total boot duration in milliseconds (Diagnostics-Performance Event 100, BootTime).",
+		"Total boot duration in milliseconds "+
+			"(Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootTime).",
 		nil, nil,
 	)
 	c.postBootTimeMs = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "post_boot_time_ms"),
-		"Post-boot phase duration in milliseconds (Diagnostics-Performance Event 100, BootPostBootTime).",
+		"Post-boot phase duration in milliseconds "+
+			"(Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootPostBootTime).",
 		nil, nil,
 	)
 	c.bootStartupApps = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "boot_startup_apps"),
-		"Number of startup applications that ran during the last boot (Diagnostics-Performance Event 100, BootNumStartupApps).",
+		"Number of startup applications that ran during the last boot "+
+			"(Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootNumStartupApps).",
 		nil, nil,
 	)
+
+	// ── Stability counters (Application log) ───────────────────────────────────
 	c.explorerCrashCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "explorer_crash_count"),
-		"Total explorer.exe crashes since the exporter started (Application log Event 1000).",
+		"Total explorer.exe crash events observed since the exporter started "+
+			"(Application log Event 1000, faulting application = explorer.exe).",
 		nil, nil,
 	)
 	c.appHangCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "application_hang_count"),
-		"Total application hang events since the exporter started (Application log Event 1002).",
+		"Total application-hang events observed since the exporter started "+
+			"(Application log Event 1002).",
 		nil, nil,
 	)
+
+	// ── Stability counters (System log) ────────────────────────────────────────
 	c.displayResetCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "display_reset_count"),
-		"Total display driver TDR recovery events since the exporter started (System log Event 4101).",
+		"Total display driver TDR recovery events observed since the exporter started "+
+			"(System log Event 4101).",
 		nil, nil,
 	)
 	c.unexpectedShutdownCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "unexpected_shutdown_count"),
-		"Total unexpected shutdown events since the exporter started (System log Event 6008).",
+		"Total unexpected-shutdown events observed since the exporter started "+
+			"(System log Event 6008).",
 		nil, nil,
 	)
 	c.kernelPowerCrashCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "kernel_power_crash_count"),
-		"Total kernel power crash events since the exporter started (System log Event 41).",
+		"Total kernel-power crash events observed since the exporter started "+
+			"(System log Event 41, e.g. BSOD or hard power loss).",
 		nil, nil,
 	)
+
+	// ── Pending reboot ─────────────────────────────────────────────────────────
 	c.pendingReboot = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "pending_reboot"),
-		"1 if a system reboot is currently pending, 0 otherwise.",
+		"1 if a system reboot is currently pending, 0 otherwise. "+
+			"Checks CBS, Windows Update, and PendingFileRenameOperations registry keys.",
 		nil, nil,
 	)
 
+	// Open event logs, positioned at the current tail so only new events are
+	// counted — consistent with the Prometheus counter-from-start convention.
 	var err error
 
-	// Open Application and System event logs; position at the current tail so
-	// only new events are counted (standard Prometheus counter pattern).
-	c.appLogState, err = openLogAtTail("Application")
+	c.appLog, err = openLogAtTail("Application")
 	if err != nil {
-		c.logger.Warn("failed to open Application event log", slog.Any("err", err))
+		c.logger.Warn("failed to open Application event log; application stability metrics will be unavailable",
+			slog.Any("err", err))
 	}
 
-	c.sysLogState, err = openLogAtTail("System")
+	c.sysLog, err = openLogAtTail("System")
 	if err != nil {
-		c.logger.Warn("failed to open System event log", slog.Any("err", err))
+		c.logger.Warn("failed to open System event log; system stability metrics will be unavailable",
+			slog.Any("err", err))
 	}
 
 	return nil
 }
 
-// Collect emits all winhealth metrics.
+// Collect emits all winhealth metrics to ch.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
-	errs := make([]error, 0, 3)
+	var errs []error
 
 	if err := c.collectBootMetrics(ch); err != nil {
 		errs = append(errs, fmt.Errorf("boot metrics: %w", err))
 	}
 
-	c.collectEventCounters()
+	c.drainEventLogs()
 
 	ch <- prometheus.MustNewConstMetric(c.explorerCrashCount, prometheus.CounterValue, c.explorerCrashTotal)
 	ch <- prometheus.MustNewConstMetric(c.appHangCount, prometheus.CounterValue, c.appHangTotal)
@@ -243,39 +279,41 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	ch <- prometheus.MustNewConstMetric(c.unexpectedShutdownCount, prometheus.CounterValue, c.unexpectedShutdownTotal)
 	ch <- prometheus.MustNewConstMetric(c.kernelPowerCrashCount, prometheus.CounterValue, c.kernelPowerCrashTotal)
 
-	if err := c.collectPendingReboot(ch); err != nil {
-		errs = append(errs, fmt.Errorf("pending reboot: %w", err))
+	pending := 0.0
+	if isPendingReboot() {
+		pending = 1.0
 	}
+
+	ch <- prometheus.MustNewConstMetric(c.pendingReboot, prometheus.GaugeValue, pending)
 
 	return errors.Join(errs...)
 }
 
-// collectBootMetrics reads the most recent Diagnostics-Performance Event 100 and
-// emits all three boot metrics from a single event record:
-//   - BootTime          → windows_boot_time_ms
-//   - BootPostBootTime  → windows_post_boot_time_ms
-//   - BootNumStartupApps → windows_boot_startup_apps
+// collectBootMetrics queries the Diagnostics-Performance channel for the most
+// recent boot event (ID 100) and emits all three boot metrics from it.
 func (c *Collector) collectBootMetrics(ch chan<- prometheus.Metric) error {
-	data, err := wevtapi.QueryLatestEventData(diagnosticsPerformanceChannel, "*[System[EventID=100]]")
+	fields, err := wevtapi.QueryLatestEventData(diagnosticsChannel, bootPerfXPath)
 	if err != nil {
-		return fmt.Errorf("query Diagnostics-Performance Event 100: %w", err)
+		return fmt.Errorf("query %s %s: %w", diagnosticsChannel, bootPerfXPath, err)
 	}
 
-	if data == nil {
-		// No boot event recorded yet (e.g. log is empty); skip silently.
+	if fields == nil {
+		// No boot event has been recorded yet; skip silently.
 		return nil
 	}
 
-	emitFloat := func(desc *prometheus.Desc, field string) {
-		raw, ok := data[field]
+	emitMs := func(desc *prometheus.Desc, fieldName string) {
+		raw, ok := fields[fieldName]
 		if !ok {
+			c.logger.Debug("boot event field not present", slog.String("field", fieldName))
+
 			return
 		}
 
 		val, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64)
 		if parseErr != nil {
-			c.logger.Warn("failed to parse boot event field",
-				slog.String("field", field),
+			c.logger.Warn("unparseable boot event field",
+				slog.String("field", fieldName),
 				slog.String("value", raw),
 				slog.Any("err", parseErr),
 			)
@@ -286,46 +324,46 @@ func (c *Collector) collectBootMetrics(ch chan<- prometheus.Metric) error {
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
 	}
 
-	emitFloat(c.bootTimeMs, "BootTime")
-	emitFloat(c.postBootTimeMs, "BootPostBootTime")
-	emitFloat(c.bootStartupApps, "BootNumStartupApps")
+	emitMs(c.bootTimeMs, "BootTime")
+	emitMs(c.postBootTimeMs, "BootPostBootTime")
+	emitMs(c.bootStartupApps, "BootNumStartupApps")
 
 	return nil
 }
 
-// collectEventCounters scans new entries in the Application and System event logs
-// and updates the running crash/hang/display counters.
-func (c *Collector) collectEventCounters() {
-	if c.appLogState != nil {
-		if err := c.scanLog(c.appLogState, "Application"); err != nil {
-			c.logger.Warn("failed to scan Application event log", slog.Any("err", err))
+// drainEventLogs reads any new records from both logs and updates counters.
+func (c *Collector) drainEventLogs() {
+	if c.appLog != nil {
+		if err := c.scanLog(c.appLog, "Application"); err != nil {
+			c.logger.Warn("error scanning Application event log", slog.Any("err", err))
 		}
 	}
 
-	if c.sysLogState != nil {
-		if err := c.scanLog(c.sysLogState, "System"); err != nil {
-			c.logger.Warn("failed to scan System event log", slog.Any("err", err))
+	if c.sysLog != nil {
+		if err := c.scanLog(c.sysLog, "System"); err != nil {
+			c.logger.Warn("error scanning System event log", slog.Any("err", err))
 		}
 	}
 }
 
-// scanLog reads newly arrived event log records and increments the appropriate counters.
-func (c *Collector) scanLog(state *logReadState, logName string) error {
+// scanLog performs a sequential forward read of new records in state, updating
+// the collector's counters for each matched event ID.
+func (c *Collector) scanLog(state *logState, logName string) error {
 	buf := make([]byte, initialReadBufferSize)
 
 	for {
 		bytesRead, minNeeded, err := readEventLog(
 			state.handle,
-			eventlogSequentialRead|eventlogForwardsRead,
+			evtlogSequentialRead|evtlogForwardsRead,
 			state.nextRecordNumber,
 			buf,
 		)
 
-		if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+		switch {
+		case errors.Is(err, windows.ERROR_HANDLE_EOF):
 			return nil
-		}
 
-		if errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		case errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER):
 			if minNeeded > 0 {
 				buf = make([]byte, minNeeded)
 			} else {
@@ -333,14 +371,11 @@ func (c *Collector) scanLog(state *logReadState, logName string) error {
 			}
 
 			continue
-		}
 
-		// ERROR_EVENTLOG_FILE_CHANGED (1503): log was cleared/rotated — reopen.
-		if errors.Is(err, windows.Errno(1503)) {
+		case errors.Is(err, windows.Errno(1503)): // ERROR_EVENTLOG_FILE_CHANGED
 			return c.reopenLog(logName, state)
-		}
 
-		if err != nil {
+		case err != nil:
 			return fmt.Errorf("ReadEventLog %q: %w", logName, err)
 		}
 
@@ -356,30 +391,10 @@ func (c *Collector) scanLog(state *logReadState, logName string) error {
 				break
 			}
 
-			// The low 16 bits of EventID carry the actual identifier.
+			// The low 16 bits of EventID carry the user-visible event identifier.
 			eventID := rec.EventID & 0xFFFF
 
-			switch eventID {
-			case eventIDKernelPowerCrash:
-				c.kernelPowerCrashTotal++
-
-			case eventIDApplicationError:
-				// Only count crashes where the faulting application is explorer.exe.
-				if strs := extractInsertionStrings(buf, offset, rec); len(strs) > 0 {
-					if strings.EqualFold(strs[0], "explorer.exe") {
-						c.explorerCrashTotal++
-					}
-				}
-
-			case eventIDApplicationHang:
-				c.appHangTotal++
-
-			case eventIDDisplayTDR:
-				c.displayResetTotal++
-
-			case eventIDUnexpectedShutdown:
-				c.unexpectedShutdownTotal++
-			}
+			c.handleEvent(buf, offset, eventID, rec)
 
 			state.nextRecordNumber = rec.RecordNumber + 1
 			offset += rec.Length
@@ -387,35 +402,105 @@ func (c *Collector) scanLog(state *logReadState, logName string) error {
 	}
 }
 
-// collectPendingReboot checks well-known registry keys and emits 1 if any
-// pending-reboot indicator is set, 0 otherwise.
-func (c *Collector) collectPendingReboot(ch chan<- prometheus.Metric) error {
-	pending := checkPendingReboot()
+// handleEvent classifies a single event record and increments the matching counter.
+func (c *Collector) handleEvent(buf []byte, offset, eventID uint32, rec *eventLogRecord) {
+	switch eventID {
+	case eventIDKernelPowerCrash:
+		c.kernelPowerCrashTotal++
 
-	val := 0.0
-	if pending {
-		val = 1.0
+	case eventIDApplicationError:
+		// Application Error events carry the faulting process name as the first
+		// insertion string. Only count events where that string is "explorer.exe".
+		if strs := extractInsertionStrings(buf, offset, rec); len(strs) > 0 {
+			if strings.EqualFold(strs[0], "explorer.exe") {
+				c.explorerCrashTotal++
+			}
+		}
+
+	case eventIDApplicationHang:
+		c.appHangTotal++
+
+	case eventIDDisplayTDR:
+		c.displayResetTotal++
+
+	case eventIDUnexpectedShutdown:
+		c.unexpectedShutdownTotal++
+	}
+}
+
+// reopenLog handles log rotation (ERROR_EVENTLOG_FILE_CHANGED): closes the
+// stale handle, reopens the log, and resets the cursor to the oldest record so
+// no new events in the rotated file are missed.
+func (c *Collector) reopenLog(logName string, state *logState) error {
+	_ = closeEventLog(state.handle)
+
+	state.handle = 0
+
+	handle, err := openEventLog(logName)
+	if err != nil {
+		return fmt.Errorf("reopen %q after rotation: %w", logName, err)
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.pendingReboot, prometheus.GaugeValue, val)
+	oldest, err := getOldestEventLogRecord(handle)
+	if err != nil {
+		_ = closeEventLog(handle)
+
+		return fmt.Errorf("get oldest record after reopen of %q: %w", logName, err)
+	}
+
+	state.handle = handle
+	state.nextRecordNumber = oldest
 
 	return nil
 }
 
-// checkPendingReboot returns true if any standard pending-reboot registry
-// indicator is present on the local system.
-func checkPendingReboot() bool {
-	// CBS (Component-Based Servicing) reboot pending.
-	if keyExists(`SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending`) {
+// openLogAtTail opens the named event log and positions the read cursor at the
+// current end so that only events arriving after this call are counted.
+func openLogAtTail(logName string) (*logState, error) {
+	handle, err := openEventLog(logName)
+	if err != nil {
+		return nil, err
+	}
+
+	count, err := getNumberOfEventLogRecords(handle)
+	if err != nil {
+		_ = closeEventLog(handle)
+
+		return nil, fmt.Errorf("get record count for %q: %w", logName, err)
+	}
+
+	var nextRecord uint32
+
+	if count == 0 {
+		nextRecord = 1
+	} else {
+		oldest, err := getOldestEventLogRecord(handle)
+		if err != nil {
+			_ = closeEventLog(handle)
+
+			return nil, fmt.Errorf("get oldest record for %q: %w", logName, err)
+		}
+
+		nextRecord = oldest + count
+	}
+
+	return &logState{handle: handle, nextRecordNumber: nextRecord}, nil
+}
+
+// isPendingReboot returns true if any standard Windows pending-reboot indicator
+// is present in the registry.
+func isPendingReboot() bool {
+	// Component-Based Servicing (Windows Update / patch installation).
+	if registryKeyExists(`SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending`) {
 		return true
 	}
 
-	// Windows Update reboot required.
-	if keyExists(`SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired`) {
+	// Windows Update auto-update reboot required.
+	if registryKeyExists(`SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired`) {
 		return true
 	}
 
-	// Pending file rename operations (often set by installers).
+	// Installer file-rename operations deferred to next boot.
 	k, err := registry.OpenKey(
 		registry.LOCAL_MACHINE,
 		`SYSTEM\CurrentControlSet\Control\Session Manager`,
@@ -433,8 +518,8 @@ func checkPendingReboot() bool {
 	return false
 }
 
-// keyExists returns true if the HKLM registry key at path can be opened.
-func keyExists(path string) bool {
+// registryKeyExists returns true when the HKLM key at path can be opened.
+func registryKeyExists(path string) bool {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE)
 	if err != nil {
 		return false
@@ -445,78 +530,18 @@ func keyExists(path string) bool {
 	return true
 }
 
-// reopenLog handles log rotation: closes the stale handle and reopens from the
-// oldest available record so no events in the new file are missed.
-func (c *Collector) reopenLog(logName string, state *logReadState) error {
-	_ = closeEventLog(state.handle)
-
-	state.handle = 0
-
-	handle, err := openEventLog(logName)
-	if err != nil {
-		return fmt.Errorf("reopen event log %q: %w", logName, err)
-	}
-
-	oldest, err := getOldestEventLogRecord(handle)
-	if err != nil {
-		_ = closeEventLog(handle)
-
-		return fmt.Errorf("get oldest record after reopen %q: %w", logName, err)
-	}
-
-	state.handle = handle
-	state.nextRecordNumber = oldest
-
-	return nil
-}
-
-// openLogAtTail opens a named event log and positions the cursor at the tail
-// (current end), so only future events are counted.
-func openLogAtTail(logName string) (*logReadState, error) {
-	handle, err := openEventLog(logName)
-	if err != nil {
-		return nil, err
-	}
-
-	numRecords, err := getNumberOfEventLogRecords(handle)
-	if err != nil {
-		_ = closeEventLog(handle)
-
-		return nil, fmt.Errorf("get record count for %q: %w", logName, err)
-	}
-
-	var nextRecord uint32
-
-	if numRecords == 0 {
-		nextRecord = 1
-	} else {
-		oldest, err := getOldestEventLogRecord(handle)
-		if err != nil {
-			_ = closeEventLog(handle)
-
-			return nil, fmt.Errorf("get oldest record for %q: %w", logName, err)
-		}
-
-		nextRecord = oldest + numRecords
-	}
-
-	return &logReadState{
-		handle:           handle,
-		nextRecordNumber: nextRecord,
-	}, nil
-}
-
-// --- advapi32 helpers (mirrors internal/collector/eventlog/eventlog.go) ---
+// ── advapi32 event-log helpers ────────────────────────────────────────────────
+// These mirror the unexported helpers in internal/collector/eventlog/eventlog.go.
 
 func openEventLog(logName string) (windows.Handle, error) {
 	ptr, err := windows.UTF16PtrFromString(logName)
 	if err != nil {
-		return 0, fmt.Errorf("convert log name: %w", err)
+		return 0, fmt.Errorf("encode log name %q: %w", logName, err)
 	}
 
 	ret, _, callErr := procOpenEventLogW.Call(0, uintptr(unsafe.Pointer(ptr)))
 	if ret == 0 {
-		return 0, fmt.Errorf("OpenEventLogW: %w", callErr)
+		return 0, fmt.Errorf("OpenEventLogW(%q): %w", logName, callErr)
 	}
 
 	return windows.Handle(ret), nil
@@ -534,7 +559,10 @@ func closeEventLog(handle windows.Handle) error {
 func getNumberOfEventLogRecords(handle windows.Handle) (uint32, error) {
 	var count uint32
 
-	ret, _, callErr := procGetNumberOfEventLogRecords.Call(uintptr(handle), uintptr(unsafe.Pointer(&count)))
+	ret, _, callErr := procGetNumberOfEventLogRecords.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&count)),
+	)
 	if ret == 0 {
 		return 0, fmt.Errorf("GetNumberOfEventLogRecords: %w", callErr)
 	}
@@ -545,7 +573,10 @@ func getNumberOfEventLogRecords(handle windows.Handle) (uint32, error) {
 func getOldestEventLogRecord(handle windows.Handle) (uint32, error) {
 	var oldest uint32
 
-	ret, _, callErr := procGetOldestEventLogRecord.Call(uintptr(handle), uintptr(unsafe.Pointer(&oldest)))
+	ret, _, callErr := procGetOldestEventLogRecord.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&oldest)),
+	)
 	if ret == 0 {
 		return 0, fmt.Errorf("GetOldestEventLogRecord: %w", callErr)
 	}
@@ -553,27 +584,27 @@ func getOldestEventLogRecord(handle windows.Handle) (uint32, error) {
 	return oldest, nil
 }
 
-func readEventLog(handle windows.Handle, readFlags, recordOffset uint32, buf []byte) (uint32, uint32, error) {
-	var bytesRead, minBytesNeeded uint32
+func readEventLog(handle windows.Handle, flags, recordOffset uint32, buf []byte) (uint32, uint32, error) {
+	var bytesRead, minNeeded uint32
 
 	ret, _, callErr := procReadEventLogW.Call(
 		uintptr(handle),
-		uintptr(readFlags),
+		uintptr(flags),
 		uintptr(recordOffset),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(len(buf)),
 		uintptr(unsafe.Pointer(&bytesRead)),
-		uintptr(unsafe.Pointer(&minBytesNeeded)),
+		uintptr(unsafe.Pointer(&minNeeded)),
 	)
 	if ret == 0 {
-		return 0, minBytesNeeded, callErr
+		return 0, minNeeded, callErr
 	}
 
 	return bytesRead, 0, nil
 }
 
-// extractInsertionStrings parses the NumStrings null-terminated UTF-16LE strings
-// stored at StringOffset inside an EVENTLOGRECORD.
+// extractInsertionStrings returns the NumStrings null-terminated UTF-16LE
+// insertion strings stored at rec.StringOffset within buf.
 func extractInsertionStrings(buf []byte, recordOffset uint32, rec *eventLogRecord) []string {
 	if rec.NumStrings == 0 || rec.StringOffset == 0 {
 		return nil
@@ -598,13 +629,13 @@ func extractInsertionStrings(buf []byte, recordOffset uint32, rec *eventLogRecor
 	pos := 0
 
 	for i := 0; i < int(rec.NumStrings) && pos < len(words); i++ {
-		nul := pos
-		for nul < len(words) && words[nul] != 0 {
-			nul++
+		end := pos
+		for end < len(words) && words[end] != 0 {
+			end++
 		}
 
-		result = append(result, windows.UTF16ToString(words[pos:nul]))
-		pos = nul + 1
+		result = append(result, windows.UTF16ToString(words[pos:end]))
+		pos = end + 1
 	}
 
 	return result
