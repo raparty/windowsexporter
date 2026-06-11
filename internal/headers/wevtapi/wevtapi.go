@@ -27,6 +27,7 @@ import (
 )
 
 // ErrNoMatchingEvents indicates that a query returned no event records.
+//nolint:gochecknoglobals
 var ErrNoMatchingEvents = errors.New("no matching events")
 
 // EvtQuery flags.
@@ -51,7 +52,7 @@ var (
 
 // QueryLatestEventData queries the named Windows Event Log channel for the
 // most recent event matching the XPath query string and returns the EventData
-// fields as a Name→Value map. Returns nil, nil when no matching event exists.
+// fields as a Name→Value map. It returns ErrNoMatchingEvents when no match exists.
 func QueryLatestEventData(channel, query string) (map[string]string, error) {
 	channelPtr, err := windows.UTF16PtrFromString(channel)
 	if err != nil {
