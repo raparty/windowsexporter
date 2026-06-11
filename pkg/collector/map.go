@@ -20,7 +20,6 @@ import (
 	"slices"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/prometheus-community/windows_exporter/internal/collector/bootperformance"
 	"github.com/prometheus-community/windows_exporter/internal/collector/ad"
 	"github.com/prometheus-community/windows_exporter/internal/collector/adcs"
 	"github.com/prometheus-community/windows_exporter/internal/collector/adfs"
@@ -80,7 +79,6 @@ func NewBuilderWithFlags[C Collector](fn BuilderWithFlags[C]) BuilderWithFlags[C
 
 //nolint:gochecknoglobals
 var BuildersWithFlags = map[string]BuilderWithFlags[Collector]{
-	bootperformance.Name: NewBuilderWithFlags(bootperformance.NewWithFlags),
 	ad.Name:        NewBuilderWithFlags(ad.NewWithFlags),
 	adcs.Name:      NewBuilderWithFlags(adcs.NewWithFlags),
 	adfs.Name:      NewBuilderWithFlags(adfs.NewWithFlags),
