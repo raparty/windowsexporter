@@ -258,8 +258,15 @@ func extractSourceName(buf []byte, recordOffset, recLen uint32) string {
 	return windows.UTF16ToString(nameWords)
 }
 
-// eventIDApplicationError is the Windows Application Error event ID.
-const eventIDApplicationError uint32 = 1000
+// Event IDs used by the derived stability counters.
+// These are always tracked regardless of the configurable event-ID filter.
+const (
+	eventIDApplicationError   uint32 = 1000 // Application log — faulting application crash
+	eventIDApplicationHang    uint32 = 1002 // Application log — application not responding
+	eventIDKernelPowerCrash   uint32 = 41   // System log — unexpected restart (BSOD / power loss)
+	eventIDDisplayTDR         uint32 = 4101 // System log — display driver TDR recovery
+	eventIDUnexpectedShutdown uint32 = 6008 // System log — previous shutdown was unexpected
+)
 
 // extractInsertionStrings parses the NumStrings null-terminated UTF-16LE
 // strings stored at StringOffset inside an EVENTLOGRECORD.
@@ -314,6 +321,22 @@ type Collector struct {
 	filter     *eventIDFilter
 	eventTotal *prometheus.Desc
 	logState   map[string]*logReadState
+
+	// Derived stability counters — always tracked, not subject to the
+	// configurable event-ID filter.  Cumulative since the exporter started.
+	explorerCrashTotal      float64
+	appHangTotal            float64
+	displayResetTotal       float64
+	unexpectedShutdownTotal float64
+	kernelPowerCrashTotal   float64
+	appCrashCounts          map[string]float64 // key = sanitized application name
+
+	explorerCrashCount      *prometheus.Desc
+	appHangCount            *prometheus.Desc
+	displayResetCount       *prometheus.Desc
+	unexpectedShutdownCount *prometheus.Desc
+	kernelPowerCrashCount   *prometheus.Desc
+	appCrashTotal           *prometheus.Desc
 }
 
 type logReadState struct {
@@ -393,6 +416,41 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		nil,
 	)
 
+	// Derived stability counters — no collector-name subsystem so the metric
+	// names are windows_<name> rather than windows_eventlog_<name>.
+	c.explorerCrashCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "explorer_crash_count"),
+		"Total explorer.exe crash events (Application log Event 1000, faulting_application=Explorer.EXE) since the exporter started.",
+		nil, nil,
+	)
+	c.appHangCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "application_hang_count"),
+		"Total application-hang events (Application log Event 1002) since the exporter started.",
+		nil, nil,
+	)
+	c.displayResetCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "display_reset_count"),
+		"Total display driver TDR recovery events (System log Event 4101) since the exporter started.",
+		nil, nil,
+	)
+	c.unexpectedShutdownCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "unexpected_shutdown_count"),
+		"Total unexpected-shutdown events (System log Event 6008) since the exporter started.",
+		nil, nil,
+	)
+	c.kernelPowerCrashCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "kernel_power_crash_count"),
+		"Total kernel-power crash events (System log Event 41, e.g. BSOD or hard power loss) since the exporter started.",
+		nil, nil,
+	)
+	c.appCrashTotal = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "app_crash_total"),
+		"Total application crash events (Application log Event 1000) grouped by faulting application name since the exporter started.",
+		[]string{"application"}, nil,
+	)
+
+	c.appCrashCounts = make(map[string]float64)
+
 	c.logState = make(map[string]*logReadState, len(c.config.LogNames))
 
 	for _, logName := range c.config.LogNames {
@@ -457,6 +515,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 		c.emitCounts(ch, logName, state)
 	}
 
+	c.emitDerivedCounters(ch)
+
 	return nil
 }
 
@@ -506,6 +566,10 @@ func (c *Collector) collectLog(logName string, state *logReadState) error {
 
 			// The low-order 16 bits of EventID contain the actual event ID.
 			eventID := rec.EventID & 0xFFFF
+
+			// Derived counters are updated for every record regardless of the
+			// configurable filter, so they always reflect ground truth.
+			c.updateDerivedCounters(buf, offset, eventID, rec)
 
 			if c.filter.contains(eventID) && rec.EventType == eventlogError {
 				source := extractSourceName(buf, offset, rec.Length)
@@ -573,5 +637,50 @@ func (c *Collector) emitCounts(ch chan<- prometheus.Metric, logName string, stat
 			key.source,
 			key.faultingApplication,
 		)
+	}
+}
+
+// updateDerivedCounters inspects a single event record and increments the
+// appropriate derived stability counter. It is called for every record,
+// independently of the configurable event-ID filter.
+func (c *Collector) updateDerivedCounters(buf []byte, offset, eventID uint32, rec *eventLogRecord) {
+	switch eventID {
+	case eventIDKernelPowerCrash:
+		c.kernelPowerCrashTotal++
+
+	case eventIDApplicationError:
+		// First insertion string is the faulting application name.
+		if strs := extractInsertionStrings(buf, offset, rec); len(strs) > 0 {
+			appName := sanitizeFaultingApplication(strs[0])
+			if appName != "" {
+				c.appCrashCounts[appName]++
+
+				if strings.EqualFold(appName, "Explorer.EXE") {
+					c.explorerCrashTotal++
+				}
+			}
+		}
+
+	case eventIDApplicationHang:
+		c.appHangTotal++
+
+	case eventIDDisplayTDR:
+		c.displayResetTotal++
+
+	case eventIDUnexpectedShutdown:
+		c.unexpectedShutdownTotal++
+	}
+}
+
+// emitDerivedCounters emits all collector-level derived stability metrics.
+func (c *Collector) emitDerivedCounters(ch chan<- prometheus.Metric) {
+	ch <- prometheus.MustNewConstMetric(c.explorerCrashCount, prometheus.CounterValue, c.explorerCrashTotal)
+	ch <- prometheus.MustNewConstMetric(c.appHangCount, prometheus.CounterValue, c.appHangTotal)
+	ch <- prometheus.MustNewConstMetric(c.displayResetCount, prometheus.CounterValue, c.displayResetTotal)
+	ch <- prometheus.MustNewConstMetric(c.unexpectedShutdownCount, prometheus.CounterValue, c.unexpectedShutdownTotal)
+	ch <- prometheus.MustNewConstMetric(c.kernelPowerCrashCount, prometheus.CounterValue, c.kernelPowerCrashTotal)
+
+	for appName, count := range c.appCrashCounts {
+		ch <- prometheus.MustNewConstMetric(c.appCrashTotal, prometheus.CounterValue, count, appName)
 	}
 }

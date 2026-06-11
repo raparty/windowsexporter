@@ -13,19 +13,19 @@
 
 //go:build windows
 
-package winhealth_test
+package bootperformance_test
 
 import (
 	"testing"
 
-	"github.com/prometheus-community/windows_exporter/internal/collector/winhealth"
+	"github.com/prometheus-community/windows_exporter/internal/collector/bootperformance"
 	"github.com/prometheus-community/windows_exporter/internal/utils/testutils"
 )
 
 func BenchmarkCollector(b *testing.B) {
-	testutils.FuncBenchmarkCollector(b, winhealth.Name, winhealth.NewWithFlags)
+	testutils.FuncBenchmarkCollector(b, bootperformance.Name, bootperformance.NewWithFlags)
 }
 
 func TestCollector(t *testing.T) {
-	testutils.TestCollector(t, winhealth.New, nil)
+	testutils.TestCollector(t, bootperformance.New, nil)
 }
