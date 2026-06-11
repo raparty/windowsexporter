@@ -17,7 +17,7 @@
 // from the Microsoft-Windows-Diagnostics-Performance/Operational event log.
 // The most recent Boot Performance Measurement event (ID 100) is queried on
 // every scrape via EvtQuery / EvtNext / EvtRender from wevtapi.dll and the
-// three timing fields are emitted as gauges.
+// four timing fields are emitted as gauges.
 package bootperformance
 
 import (
@@ -55,9 +55,10 @@ type Collector struct {
 	config Config
 	logger *slog.Logger
 
-	bootTimeMs      *prometheus.Desc
-	postBootTimeMs  *prometheus.Desc
-	bootStartupApps *prometheus.Desc
+	bootTimeMs          *prometheus.Desc
+	mainPathBootTimeMs  *prometheus.Desc
+	postBootTimeMs      *prometheus.Desc
+	bootStartupApps     *prometheus.Desc
 }
 
 func New(config *Config) *Collector {
@@ -85,6 +86,12 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		prometheus.BuildFQName(types.Namespace, "", "boot_time_ms"),
 		"Total boot duration in milliseconds "+
 			"(Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootTime).",
+		nil, nil,
+	)
+	c.mainPathBootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "mainpath_boot_time_ms"),
+		"Main boot path duration in milliseconds "+
+			"(Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field MainPathBootTime).",
 		nil, nil,
 	)
 	c.postBootTimeMs = prometheus.NewDesc(
@@ -143,6 +150,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	}
 
 	emitGauge(c.bootTimeMs, "BootTime")
+	emitGauge(c.mainPathBootTimeMs, "MainPathBootTime")
 	emitGauge(c.postBootTimeMs, "BootPostBootTime")
 	emitGauge(c.bootStartupApps, "BootNumStartupApps")
 

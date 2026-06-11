@@ -19,7 +19,6 @@
 package wevtapi
 
 import (
-	"encoding/xml"
 	"fmt"
 	"unsafe"
 
@@ -45,18 +44,6 @@ var (
 	procEvtRender = modWevtapi.NewProc("EvtRender")
 	procEvtClose  = modWevtapi.NewProc("EvtClose")
 )
-
-// eventXML is a minimal representation of a Windows Event Log XML envelope,
-// used only to extract EventData Name→Value pairs.
-type eventXML struct {
-	XMLName   xml.Name `xml:"Event"`
-	EventData struct {
-		Data []struct {
-			Name  string `xml:"Name,attr"`
-			Value string `xml:",chardata"`
-		} `xml:"Data"`
-	} `xml:"EventData"`
-}
 
 // QueryLatestEventData queries the named Windows Event Log channel for the
 // most recent event matching the XPath query string and returns the EventData
@@ -144,6 +131,7 @@ func renderEventData(eventHandle windows.Handle) (map[string]string, error) {
 		return nil, fmt.Errorf("EvtRender: %w", callErr)
 	}
 
+	return ParseEventXML(windows.UTF16ToString(buf))
 	return ParseEventDataXML([]byte(windows.UTF16ToString(buf)))
 }
 
