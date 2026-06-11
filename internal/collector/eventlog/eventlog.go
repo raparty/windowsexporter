@@ -24,6 +24,7 @@ import (
 	"unsafe"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus-community/windows_exporter/internal/headers/wevtapi"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +50,12 @@ const (
 )
 
 const initialReadBufferSize = 64 * 1024
+
+// Boot performance event constants
+const (
+	diagnosticsChannel = "Microsoft-Windows-Diagnostics-Performance/Operational"
+	bootPerfXPath      = "*[System[EventID=100]]"
+)
 
 //nolint:gochecknoglobals
 var eventLevelNames = map[uint16]string{
@@ -337,6 +344,12 @@ type Collector struct {
 	unexpectedShutdownCount *prometheus.Desc
 	kernelPowerCrashCount   *prometheus.Desc
 	appCrashTotal           *prometheus.Desc
+
+	// Boot performance metrics
+	bootTimeMs      *prometheus.Desc
+	mainPathBootTimeMs *prometheus.Desc
+	postBootTimeMs  *prometheus.Desc
+	bootStartupApps *prometheus.Desc
 }
 
 type logReadState struct {
@@ -449,6 +462,28 @@ func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 		[]string{"application"}, nil,
 	)
 
+	// Boot performance metrics
+	c.bootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_time_ms"),
+		"Total boot duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootTime.",
+		nil, nil,
+	)
+	c.mainPathBootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "mainpath_boot_time_ms"),
+		"Main boot path duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field MainPathBootTime.",
+		nil, nil,
+	)
+	c.postBootTimeMs = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "post_boot_time_ms"),
+		"Post-boot duration in milliseconds from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootPostBootTime.",
+		nil, nil,
+	)
+	c.bootStartupApps = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "boot_startup_apps"),
+		"Number of startup applications recorded during boot from Microsoft-Windows-Diagnostics-Performance/Operational Event 100, field BootNumStartupApps.",
+		nil, nil,
+	)
+
 	c.appCrashCounts = make(map[string]float64)
 
 	c.logState = make(map[string]*logReadState, len(c.config.LogNames))
@@ -516,6 +551,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	}
 
 	c.emitDerivedCounters(ch)
+	c.collectBootPerformanceMetrics(ch)
 
 	return nil
 }
@@ -683,4 +719,47 @@ func (c *Collector) emitDerivedCounters(ch chan<- prometheus.Metric) {
 	for appName, count := range c.appCrashCounts {
 		ch <- prometheus.MustNewConstMetric(c.appCrashTotal, prometheus.CounterValue, count, appName)
 	}
+}
+
+// collectBootPerformanceMetrics queries the most recent boot performance event
+// and emits the boot-timing gauges. If no event exists the metrics are omitted
+// rather than emitting zero, so stale data is never presented.
+func (c *Collector) collectBootPerformanceMetrics(ch chan<- prometheus.Metric) {
+	fields, err := wevtapi.QueryLatestEventData(diagnosticsChannel, bootPerfXPath)
+	if err != nil {
+		c.logger.Debug("failed to query boot performance metrics", slog.Any("err", err))
+		return
+	}
+
+	if fields == nil {
+		// The Diagnostics-Performance log is empty or the channel is not
+		// available on this system (e.g. stripped/server SKUs). Skip silently.
+		c.logger.Debug("no boot performance event found; skipping boot metrics")
+		return
+	}
+
+	emitBootGauge := func(desc *prometheus.Desc, fieldName string) {
+		raw, ok := fields[fieldName]
+		if !ok {
+			c.logger.Debug("boot event field absent", slog.String("field", fieldName))
+			return
+		}
+
+		val, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if parseErr != nil {
+			c.logger.Warn("unparseable boot event field",
+				slog.String("field", fieldName),
+				slog.String("raw", raw),
+				slog.Any("err", parseErr),
+			)
+			return
+		}
+
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+	}
+
+	emitBootGauge(c.bootTimeMs, "BootTime")
+	emitBootGauge(c.mainPathBootTimeMs, "MainPathBootTime")
+	emitBootGauge(c.postBootTimeMs, "BootPostBootTime")
+	emitBootGauge(c.bootStartupApps, "BootNumStartupApps")
 }
