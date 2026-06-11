@@ -13,11 +13,12 @@
 
 //go:build windows
 
-// Package winhealth collects Windows health and stability metrics:
-//   - Boot duration and post-boot duration from the Diagnostics-Performance event log
-//   - Count of registered startup applications
-//   - Counts of display driver resets, explorer crashes, and application hangs
-//   - Whether a system reboot is currently pending
+// Package winhealth collects Windows health and stability metrics.
+//
+// All boot metrics (boot time, post-boot time, startup app count) are read
+// from Diagnostics-Performance Event ID 100. Crash/hang/shutdown counters
+// are accumulated from the Application and System classic event logs.
+// Pending-reboot status is derived from well-known registry keys.
 package winhealth
 
 import (
@@ -40,17 +41,20 @@ import (
 // Name is the collector name used for registration and logging.
 const Name = "winhealth"
 
-// Diagnostics-Performance event IDs used for boot timing.
-const (
-	eventIDBootPerf     uint32 = 100
-	eventIDPostBootPerf uint32 = 200
-)
+// diagnosticsPerformanceChannel is the ETW channel that contains boot timing events.
+const diagnosticsPerformanceChannel = "Microsoft-Windows-Diagnostics-Performance/Operational"
 
-// Windows Application/System log event IDs tracked as counters.
+// eventIDBootPerf is the Diagnostics-Performance event that carries all boot
+// timing fields: BootTime, BootPostBootTime, and BootNumStartupApps.
+const eventIDBootPerf uint32 = 100
+
+// Classic event log event IDs accumulated as Prometheus counters.
 const (
-	eventIDApplicationError uint32 = 1000
-	eventIDApplicationHang  uint32 = 1002
-	eventIDDisplayTDR       uint32 = 4101
+	eventIDKernelPowerCrash    uint32 = 41   // System log — unexpected restart (BSOD / hard power loss)
+	eventIDApplicationError    uint32 = 1000 // Application log — application crash
+	eventIDApplicationHang     uint32 = 1002 // Application log — application hang
+	eventIDDisplayTDR          uint32 = 4101 // System log — display driver TDR recovery
+	eventIDUnexpectedShutdown  uint32 = 6008 // System log — previous shutdown was unexpected
 )
 
 // advapi32 sequential-read flags (mirrors eventlog collector).
@@ -97,11 +101,6 @@ type logReadState struct {
 	nextRecordNumber uint32
 }
 
-// startupCommand maps a single Win32_StartupCommand WMI result row.
-type startupCommand struct {
-	Name string `mi:"Name"`
-}
-
 // Config holds collector configuration (currently empty; reserved for future flags).
 type Config struct{}
 
@@ -113,25 +112,26 @@ type Collector struct {
 	config Config
 	logger *slog.Logger
 
-	miSession         *mi.Session
-	startupCmdQuery   mi.Query
-
 	appLogState *logReadState
 	sysLogState *logReadState
 
 	// running counters updated each Collect
-	explorerCrashTotal  float64
-	appHangTotal        float64
-	displayResetTotal   float64
+	explorerCrashTotal     float64
+	appHangTotal           float64
+	displayResetTotal      float64
+	unexpectedShutdownTotal float64
+	kernelPowerCrashTotal  float64
 
 	// metric descriptors
-	bootTimeMs        *prometheus.Desc
-	postBootTimeMs    *prometheus.Desc
-	bootStartupApps   *prometheus.Desc
-	displayResetCount *prometheus.Desc
-	explorerCrashCount *prometheus.Desc
-	appHangCount      *prometheus.Desc
-	pendingReboot     *prometheus.Desc
+	bootTimeMs             *prometheus.Desc
+	postBootTimeMs         *prometheus.Desc
+	bootStartupApps        *prometheus.Desc
+	explorerCrashCount     *prometheus.Desc
+	appHangCount           *prometheus.Desc
+	displayResetCount      *prometheus.Desc
+	unexpectedShutdownCount *prometheus.Desc
+	kernelPowerCrashCount  *prometheus.Desc
+	pendingReboot          *prometheus.Desc
 }
 
 func New(config *Config) *Collector {
@@ -160,38 +160,48 @@ func (c *Collector) Close() error {
 	return nil
 }
 
-func (c *Collector) Build(logger *slog.Logger, miSession *mi.Session) error {
+func (c *Collector) Build(logger *slog.Logger, _ *mi.Session) error {
 	c.logger = logger.With(slog.String("collector", Name))
 
-	// Metric descriptors — names match the specification exactly.
+	// All three boot metrics are read from Diagnostics-Performance Event 100.
 	c.bootTimeMs = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "boot_time_ms"),
-		"Duration of the last system boot in milliseconds, from the Diagnostics-Performance event log (Event ID 100).",
+		"Total boot duration in milliseconds (Diagnostics-Performance Event 100, BootTime).",
 		nil, nil,
 	)
 	c.postBootTimeMs = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "post_boot_time_ms"),
-		"Duration of the post-boot phase in milliseconds, from the Diagnostics-Performance event log (Event ID 200).",
+		"Post-boot phase duration in milliseconds (Diagnostics-Performance Event 100, BootPostBootTime).",
 		nil, nil,
 	)
 	c.bootStartupApps = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "boot_startup_apps"),
-		"Number of applications registered to run at startup (Win32_StartupCommand).",
-		nil, nil,
-	)
-	c.displayResetCount = prometheus.NewDesc(
-		prometheus.BuildFQName(types.Namespace, "", "display_reset_count"),
-		"Total number of display driver TDR recovery events (System log Event ID 4101) since the exporter started.",
+		"Number of startup applications that ran during the last boot (Diagnostics-Performance Event 100, BootNumStartupApps).",
 		nil, nil,
 	)
 	c.explorerCrashCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "explorer_crash_count"),
-		"Total number of explorer.exe crashes (Application log Event ID 1000) since the exporter started.",
+		"Total explorer.exe crashes since the exporter started (Application log Event 1000).",
 		nil, nil,
 	)
 	c.appHangCount = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, "", "application_hang_count"),
-		"Total number of application hang events (Application log Event ID 1002) since the exporter started.",
+		"Total application hang events since the exporter started (Application log Event 1002).",
+		nil, nil,
+	)
+	c.displayResetCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "display_reset_count"),
+		"Total display driver TDR recovery events since the exporter started (System log Event 4101).",
+		nil, nil,
+	)
+	c.unexpectedShutdownCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "unexpected_shutdown_count"),
+		"Total unexpected shutdown events since the exporter started (System log Event 6008).",
+		nil, nil,
+	)
+	c.kernelPowerCrashCount = prometheus.NewDesc(
+		prometheus.BuildFQName(types.Namespace, "", "kernel_power_crash_count"),
+		"Total kernel power crash events since the exporter started (System log Event 41).",
 		nil, nil,
 	)
 	c.pendingReboot = prometheus.NewDesc(
@@ -200,19 +210,7 @@ func (c *Collector) Build(logger *slog.Logger, miSession *mi.Session) error {
 		nil, nil,
 	)
 
-	// WMI session for startup app count.
-	if miSession == nil {
-		return errors.New("miSession is nil")
-	}
-
-	c.miSession = miSession
-
-	query, err := mi.NewQuery("SELECT Name FROM Win32_StartupCommand")
-	if err != nil {
-		return fmt.Errorf("create Win32_StartupCommand query: %w", err)
-	}
-
-	c.startupCmdQuery = query
+	var err error
 
 	// Open Application and System event logs; position at the current tail so
 	// only new events are counted (standard Prometheus counter pattern).
@@ -231,21 +229,19 @@ func (c *Collector) Build(logger *slog.Logger, miSession *mi.Session) error {
 
 // Collect emits all winhealth metrics.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
-	errs := make([]error, 0, 4)
+	errs := make([]error, 0, 3)
 
 	if err := c.collectBootMetrics(ch); err != nil {
 		errs = append(errs, fmt.Errorf("boot metrics: %w", err))
 	}
 
-	if err := c.collectStartupApps(ch); err != nil {
-		errs = append(errs, fmt.Errorf("startup apps: %w", err))
-	}
-
 	c.collectEventCounters()
 
-	ch <- prometheus.MustNewConstMetric(c.displayResetCount, prometheus.CounterValue, c.displayResetTotal)
 	ch <- prometheus.MustNewConstMetric(c.explorerCrashCount, prometheus.CounterValue, c.explorerCrashTotal)
 	ch <- prometheus.MustNewConstMetric(c.appHangCount, prometheus.CounterValue, c.appHangTotal)
+	ch <- prometheus.MustNewConstMetric(c.displayResetCount, prometheus.CounterValue, c.displayResetTotal)
+	ch <- prometheus.MustNewConstMetric(c.unexpectedShutdownCount, prometheus.CounterValue, c.unexpectedShutdownTotal)
+	ch <- prometheus.MustNewConstMetric(c.kernelPowerCrashCount, prometheus.CounterValue, c.kernelPowerCrashTotal)
 
 	if err := c.collectPendingReboot(ch); err != nil {
 		errs = append(errs, fmt.Errorf("pending reboot: %w", err))
@@ -254,47 +250,45 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) error {
 	return errors.Join(errs...)
 }
 
-// collectBootMetrics reads the most recent boot and post-boot durations from
-// the Microsoft-Windows-Diagnostics-Performance/Operational event log.
+// collectBootMetrics reads the most recent Diagnostics-Performance Event 100 and
+// emits all three boot metrics from a single event record:
+//   - BootTime          → windows_boot_time_ms
+//   - BootPostBootTime  → windows_post_boot_time_ms
+//   - BootNumStartupApps → windows_boot_startup_apps
 func (c *Collector) collectBootMetrics(ch chan<- prometheus.Metric) error {
-	const channel = "Microsoft-Windows-Diagnostics-Performance/Operational"
-
-	// Event 100 → BootTime field gives total boot duration in ms.
-	bootData, err := wevtapi.QueryLatestEventData(channel, "*[System[EventID=100]]")
+	data, err := wevtapi.QueryLatestEventData(diagnosticsPerformanceChannel, "*[System[EventID=100]]")
 	if err != nil {
-		c.logger.Warn("failed to query boot time event", slog.Any("err", err))
-	} else if bootData != nil {
-		if raw, ok := bootData["BootTime"]; ok {
-			if ms, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64); parseErr == nil {
-				ch <- prometheus.MustNewConstMetric(c.bootTimeMs, prometheus.GaugeValue, ms)
-			}
+		return fmt.Errorf("query Diagnostics-Performance Event 100: %w", err)
+	}
+
+	if data == nil {
+		// No boot event recorded yet (e.g. log is empty); skip silently.
+		return nil
+	}
+
+	emitFloat := func(desc *prometheus.Desc, field string) {
+		raw, ok := data[field]
+		if !ok {
+			return
 		}
-	}
 
-	// Event 200 → MainPathBootTime field gives post-boot phase duration in ms.
-	postData, err := wevtapi.QueryLatestEventData(channel, "*[System[EventID=200]]")
-	if err != nil {
-		c.logger.Warn("failed to query post-boot time event", slog.Any("err", err))
-	} else if postData != nil {
-		if raw, ok := postData["MainPathBootTime"]; ok {
-			if ms, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64); parseErr == nil {
-				ch <- prometheus.MustNewConstMetric(c.postBootTimeMs, prometheus.GaugeValue, ms)
-			}
+		val, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if parseErr != nil {
+			c.logger.Warn("failed to parse boot event field",
+				slog.String("field", field),
+				slog.String("value", raw),
+				slog.Any("err", parseErr),
+			)
+
+			return
 		}
+
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
 	}
 
-	return nil
-}
-
-// collectStartupApps counts WMI Win32_StartupCommand entries.
-func (c *Collector) collectStartupApps(ch chan<- prometheus.Metric) error {
-	var dst []startupCommand
-
-	if err := c.miSession.Query(&dst, mi.NamespaceRootCIMv2, c.startupCmdQuery); err != nil {
-		return fmt.Errorf("WMI query Win32_StartupCommand: %w", err)
-	}
-
-	ch <- prometheus.MustNewConstMetric(c.bootStartupApps, prometheus.GaugeValue, float64(len(dst)))
+	emitFloat(c.bootTimeMs, "BootTime")
+	emitFloat(c.postBootTimeMs, "BootPostBootTime")
+	emitFloat(c.bootStartupApps, "BootNumStartupApps")
 
 	return nil
 }
@@ -366,11 +360,8 @@ func (c *Collector) scanLog(state *logReadState, logName string) error {
 			eventID := rec.EventID & 0xFFFF
 
 			switch eventID {
-			case eventIDDisplayTDR:
-				c.displayResetTotal++
-
-			case eventIDApplicationHang:
-				c.appHangTotal++
+			case eventIDKernelPowerCrash:
+				c.kernelPowerCrashTotal++
 
 			case eventIDApplicationError:
 				// Only count crashes where the faulting application is explorer.exe.
@@ -379,6 +370,15 @@ func (c *Collector) scanLog(state *logReadState, logName string) error {
 						c.explorerCrashTotal++
 					}
 				}
+
+			case eventIDApplicationHang:
+				c.appHangTotal++
+
+			case eventIDDisplayTDR:
+				c.displayResetTotal++
+
+			case eventIDUnexpectedShutdown:
+				c.unexpectedShutdownTotal++
 			}
 
 			state.nextRecordNumber = rec.RecordNumber + 1
