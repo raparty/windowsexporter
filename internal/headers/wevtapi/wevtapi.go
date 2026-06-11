@@ -144,17 +144,20 @@ func renderEventData(eventHandle windows.Handle) (map[string]string, error) {
 		return nil, fmt.Errorf("EvtRender: %w", callErr)
 	}
 
-	xmlStr := windows.UTF16ToString(buf)
+	return ParseEventDataXML([]byte(windows.UTF16ToString(buf)))
+}
 
+// ParseEventDataXML extracts EventData Name-to-value pairs from rendered event XML.
+func ParseEventDataXML(data []byte) (map[string]string, error) {
 	var ev eventXML
-	if err := xml.Unmarshal([]byte(xmlStr), &ev); err != nil {
+	if err := xml.Unmarshal(data, &ev); err != nil {
 		return nil, fmt.Errorf("parse event XML: %w", err)
 	}
 
 	fields := make(map[string]string, len(ev.EventData.Data))
 
-	for _, d := range ev.EventData.Data {
-		fields[d.Name] = d.Value
+	for _, eventData := range ev.EventData.Data {
+		fields[eventData.Name] = eventData.Value
 	}
 
 	return fields, nil
